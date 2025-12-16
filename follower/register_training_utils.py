@@ -1,4 +1,4 @@
-from follower.model import ResnetEncoder
+from follower.model import ResnetEncoder, CNNTransformerEncoder
 
 from sample_factory.algo.utils.context import global_model_factory
 from sample_factory.utils.typing import ObsSpace
@@ -39,6 +39,10 @@ def register_msg_handlers(cfg: Config, runner: Runner):
 
 def make_custom_encoder(cfg: Config, obs_space: ObsSpace) -> Encoder:
     """Factory function as required by the API."""
+    enc_cfg = getattr(cfg, 'encoder', {})
+    arch = enc_cfg.get('encoder_arch', 'resnet') if isinstance(enc_cfg, dict) else 'resnet'
+    if arch == 'cnn_transformer':
+        return CNNTransformerEncoder(cfg, obs_space)
     return ResnetEncoder(cfg, obs_space)
 
 

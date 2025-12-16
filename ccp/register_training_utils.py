@@ -1,4 +1,4 @@
-from ccp.model import ResnetEncoder, CNNTransformerEncoder
+from ccp.model import ResnetEncoder, CNNTransformerEncoder, STGATFormerEncoder
 
 from sample_factory.algo.utils.context import global_model_factory
 from sample_factory.utils.typing import ObsSpace
@@ -43,6 +43,8 @@ def make_custom_encoder(cfg: Config, obs_space: ObsSpace) -> Encoder:
     arch = enc_cfg.get('encoder_arch', 'resnet') if isinstance(enc_cfg, dict) else 'resnet'
     if arch == 'cnn_transformer':
         return CNNTransformerEncoder(cfg, obs_space)
+    if arch == 'st_gat_former':
+        return STGATFormerEncoder(cfg, obs_space)
     return ResnetEncoder(cfg, obs_space)
 
 

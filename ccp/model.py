@@ -39,7 +39,7 @@ class EncoderConfig(BaseModel):
     - Follower: num_filters=64, num_res_blocks=8, extra_fc_layers=1, hidden_size=512
     - FollowerLite: num_filters=8, num_res_blocks=1, extra_fc_layers=0
     '''
-    encoder_arch: Literal['resnet', 'cnn_transformer'] = 'resnet'
+    encoder_arch: Literal['resnet', 'cnn_transformer', 'st_gat_former'] = 'resnet'
     extra_fc_layers: int = 0  # 额外全连接层数量，默认0（不使用）
     num_filters: int = 64  # 卷积层滤波器数量，决定特征图通道数
     num_res_blocks: int = 1  # ResNet残差块数量，决定网络深度
@@ -350,6 +350,156 @@ class CNNTransformerEncoder(Encoder):
             x = self.extra_linear(x)
 
         return x
+
+
+class STGATFormerEncoder(Encoder):
+    def __init__(self, cfg: Config, obs_space: ObsSpace):
+        super().__init__(cfg)
+        self.encoder_cfg: EncoderConfig = EncoderConfig(**cfg.encoder) # 读入编码器的相关配置
+
+        input_ch = obs_space['obs'].shape[0] # 获取输入的通道数
+
+        d_model = int(self.encoder_cfg.num_filters) # 获取模型的维度
+        nhead = int(self.encoder_cfg.transformer_nhead) # 获取注意力头数
+        if d_model % nhead != 0:
+            log.warning(
+                'transformer_nhead (%d) does not divide d_model (%d), using nhead=1',
+                nhead,
+                d_model,
+            )
+            nhead = 1
+
+        self.grid_encoder = nn.Sequential(
+            nn.Conv2d(input_ch, d_model, kernel_size=3, stride=1, padding=1),
+            activation_func(self.encoder_cfg),
+            nn.Conv2d(d_model, d_model, kernel_size=3, stride=1, padding=1),
+            activation_func(self.encoder_cfg),
+        )
+
+        self.grid_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.goal_mlp = nn.Sequential(
+            nn.Linear(2, d_model),
+            activation_func(self.encoder_cfg),
+            nn.Linear(d_model, d_model),
+        )
+
+        self.heur_encoder = nn.Sequential(
+            nn.Conv2d(1, d_model, kernel_size=3, stride=1, padding=1),
+            activation_func(self.encoder_cfg),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+
+        self.neighbor_mlp = nn.Sequential(
+            nn.Linear(2, d_model),
+            activation_func(self.encoder_cfg),
+            nn.Linear(d_model, d_model),
+        )
+
+        max_neighbors = int(obs_space['agents_xy'].shape[0]) if 'agents_xy' in obs_space else 0
+        self._max_neighbors = max_neighbors
+        l = 1 + max_neighbors
+        if l > 0:
+            attn_mask = torch.ones((l, l), dtype=torch.bool)
+            attn_mask[0, :] = False
+            attn_mask[:, 0] = False
+            attn_mask.fill_diagonal_(False)
+        else:
+            attn_mask = torch.zeros((1, 1), dtype=torch.bool)
+        self.register_buffer('_star_attn_mask', attn_mask, persistent=False)
+
+        self.gat_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=True)
+        self.gat_norm = nn.LayerNorm(d_model)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=int(self.encoder_cfg.transformer_dim_feedforward),
+            dropout=float(self.encoder_cfg.transformer_dropout),
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_transformer = nn.TransformerEncoder(layer, num_layers=int(self.encoder_cfg.transformer_num_layers))
+
+        self.encoder_out_size = d_model
+        if self.encoder_cfg.extra_fc_layers:
+            self.extra_linear = nn.Sequential(
+                nn.Linear(self.encoder_out_size, self.encoder_cfg.hidden_size),
+                activation_func(self.encoder_cfg),
+            )
+            self.encoder_out_size = self.encoder_cfg.hidden_size
+
+        log.debug('ST-GAT-Former max_neighbors: %r, d_model: %r', self._max_neighbors, d_model)
+
+    def get_out_size(self) -> int:
+        return self.encoder_out_size
+
+    def forward(self, x):
+        obs = x['obs']
+
+        grid_feat = self.grid_encoder(obs)
+        self_token = self.grid_pool(grid_feat).flatten(1)
+
+        if 'xy' in x and 'target_xy' in x:
+            goal_vec = (x['target_xy'] - x['xy']).to(self_token.dtype)
+            if goal_vec.ndim == 1:
+                goal_vec = goal_vec.unsqueeze(0)
+        else:
+            goal_vec = self_token.new_zeros((self_token.shape[0], 2))
+        goal_emb = self.goal_mlp(goal_vec)
+
+        heur_map = obs[:, :1]
+        heur_emb = self.heur_encoder(heur_map).flatten(1)
+
+        self_node = (self_token + goal_emb + heur_emb).unsqueeze(1)
+
+        if 'agents_xy' in x and self._max_neighbors > 0:
+            neigh_xy = x['agents_xy'].to(self_node.dtype)
+            if neigh_xy.ndim == 2:
+                neigh_xy = neigh_xy.unsqueeze(0)
+            neigh_xy = neigh_xy[:, :self._max_neighbors]
+            neigh_nodes = self.neighbor_mlp(neigh_xy)
+        else:
+            neigh_nodes = self_node.new_zeros((self_node.shape[0], self._max_neighbors, self_node.shape[-1]))
+
+        nodes = torch.cat([self_node, neigh_nodes], dim=1)
+
+        if 'agents_xy_mask' in x and self._max_neighbors > 0:
+            neigh_mask = x['agents_xy_mask']
+            if neigh_mask.ndim == 1:
+                neigh_mask = neigh_mask.unsqueeze(0)
+            neigh_mask = neigh_mask[:, :self._max_neighbors]
+            pad = neigh_mask <= 0.0
+        else:
+            pad = torch.ones((nodes.shape[0], self._max_neighbors), device=nodes.device, dtype=torch.bool)
+
+        key_padding_mask = torch.cat(
+            [torch.zeros((nodes.shape[0], 1), device=nodes.device, dtype=torch.bool), pad.to(torch.bool)],
+            dim=1,
+        )
+
+        attn_mask = self._star_attn_mask
+        if attn_mask.device != nodes.device:
+            attn_mask = attn_mask.to(nodes.device)
+        attn_out, _ = self.gat_attn(
+            nodes,
+            nodes,
+            nodes,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=False,
+        )
+        nodes = self.gat_norm(nodes + attn_out)
+
+        nodes = self.temporal_transformer(nodes, src_key_padding_mask=key_padding_mask)
+
+        out = nodes[:, 0]
+
+        if self.encoder_cfg.extra_fc_layers:
+            out = self.extra_linear(out)
+
+        return out
 
 
 def main():

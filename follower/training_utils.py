@@ -26,7 +26,7 @@ def create_sf_config(exp: Experiment):
 
 
 def run(config=None):
-    register_custom_model()
+    register_custom_model() # 注册自定义的encoder模型 
 
     if config is None:
         import argparse
@@ -59,7 +59,7 @@ def run(config=None):
     flat_config = Namespace(**exp.dict())
     env_name = exp.environment.env
     log.debug(f'env_name = {env_name}')
-    register_custom_components(env_name)
+    register_custom_components(env_name) # 注册自定义环境创建函数给SampleFactory
 
     log.info(flat_config)
 
@@ -70,13 +70,14 @@ def run(config=None):
         import os
         if params.wandb_thread_mode:
             os.environ["WANDB_START_METHOD"] = "thread"
-        wandb.init(project='Learn-to-Follow', config=exp.dict(), save_code=False, sync_tensorboard=True,
+        # 绑定wandb对应的训练可视化库
+        wandb.init(project='follow-lite', config=exp.dict(), save_code=False, sync_tensorboard=True,
                    anonymous="allow", job_type=exp.environment.env, group='train')
 
-    flat_config, runner = make_runner(create_sf_config(exp))
-    register_msg_handlers(flat_config, runner)
-    status = runner.init()
+    flat_config, runner = make_runner(create_sf_config(exp)) # 将模型交给SampleFactory跑PPO，实际上就是将实验设置好的配置参数exp传递给SampleFactory函数接口
+    register_msg_handlers(flat_config, runner) # 注册消息处理函数
+    status = runner.init() # 训练初始化
     if status == ExperimentStatus.SUCCESS:
-        status = runner.run()
+        status = runner.run() # 训练开始
 
     return status

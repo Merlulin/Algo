@@ -24,6 +24,8 @@ class PreprocessorConfig(PlannerConfig):
     network_input_radius: int = 5  # 网络输入的观测半径，默认5（11x11观测窗口）
     intrinsic_target_reward: float = 0.01  # 到达子目标时的内在奖励值
 
+    graph_max_neighbors: int = 8
+
 
 def ccp_preprocessor(env, algo_config):
     '''
@@ -78,10 +80,60 @@ def wrap_preprocessors(env, config: PreprocessorConfig, auto_reset=False):
     '''
     env = CCPWrapper(env=env, config=config)  # 添加路径规划和内在奖励
     env = CutObservationWrapper(env, target_observation_radius=config.network_input_radius)  # 裁剪观测大小
+    env = GraphInputsWrapper(env, max_neighbors=config.graph_max_neighbors)
     env = ConcatPositionalFeatures(env)  # 拼接位置特征
     if auto_reset:
         env = AutoResetWrapper(env)  # 自动重置（训练时使用）
     return env
+
+
+class GraphInputsWrapper(ObservationWrapper):
+    def __init__(self, env, max_neighbors: int):
+        super().__init__(env)
+        self._max_neighbors = int(max_neighbors)
+
+        observation_space = Dict(self.observation_space)
+        observation_space['agents_xy'] = Box(-1.0, 1.0, shape=(self._max_neighbors, 2))
+        observation_space['agents_xy_mask'] = Box(0.0, 1.0, shape=(self._max_neighbors,))
+        self.observation_space = observation_space
+
+    def observation(self, observations):
+        k = self._max_neighbors
+        for obs in observations:
+            agents = obs.get('agents', None)
+            if agents is None or not hasattr(agents, 'shape') or agents.ndim != 2:
+                obs['agents_xy'] = np.zeros((k, 2), dtype=np.float32)
+                obs['agents_xy_mask'] = np.zeros((k,), dtype=np.float32)
+                continue
+
+            r = int(agents.shape[0] // 2)
+            denom = float(max(r, 1))
+            coords = np.argwhere(agents > 0)
+
+            if coords.shape[0] > 0:
+                center = np.array([r, r], dtype=np.int64)
+                not_center = np.any(coords != center[None], axis=1)
+                coords = coords[not_center]
+
+            if coords.shape[0] > 0:
+                rel = (coords.astype(np.float32) - np.array([r, r], dtype=np.float32)) / denom
+                dist = np.abs(rel[:, 0]) + np.abs(rel[:, 1])
+                order = np.argsort(dist)
+                rel = rel[order]
+            else:
+                rel = np.zeros((0, 2), dtype=np.float32)
+
+            n = int(min(k, rel.shape[0]))
+            out_xy = np.zeros((k, 2), dtype=np.float32)
+            out_m = np.zeros((k,), dtype=np.float32)
+            if n > 0:
+                out_xy[:n] = rel[:n]
+                out_m[:n] = 1.0
+
+            obs['agents_xy'] = out_xy
+            obs['agents_xy_mask'] = out_m
+
+        return observations
 
 
 class CCPWrapper(ObservationWrapper):

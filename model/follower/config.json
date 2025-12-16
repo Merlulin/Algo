@@ -1,4 +1,5 @@
 {
+  "policy_index": 2,
   "help": false,
   "algo": "APPO",
   "env": "PogemaMazes-v0",

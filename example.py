@@ -1,6 +1,6 @@
 import argparse
 
-from env.create_env import create_env_base
+from env.create_env import create_env_base  
 from env.custom_maps import MAPS_REGISTRY
 from utils.eval_utils import run_episode
 from follower.training_config import EnvironmentMazes
@@ -9,6 +9,8 @@ from follower.preprocessing import follower_preprocessor
 from follower_cpp.inference import FollowerConfigCPP, FollowerInferenceCPP
 from follower_cpp.preprocessing import follower_cpp_preprocessor
 
+from ccp.inference import CCPInferenceConfig, CCPInference
+from ccp.preprocessing import ccp_preprocessor
 
 def create_custom_env(cfg):
     env_cfg = EnvironmentMazes(with_animation=cfg.animation)
@@ -17,6 +19,15 @@ def create_custom_env(cfg):
     env_cfg.grid_config.seed = cfg.seed
     env_cfg.grid_config.max_episode_steps = cfg.max_episode_steps
     return create_env_base(env_cfg)
+
+
+def run_ccp(env):
+    follower_cfg = CCPInferenceConfig()
+    algo = CCPInference(follower_cfg)
+
+    env = ccp_preprocessor(env, follower_cfg)
+
+    return run_episode(env, algo)
 
 
 def run_follower(env):
@@ -47,7 +58,7 @@ def main():
                         help='Maximum episode steps (default: %(default)d)')
     parser.add_argument('--show_map_names', action='store_true', help='Shows names of all available maps')
 
-    parser.add_argument('--algorithm', type=str, choices=['Follower', 'FollowerLite'], default='Follower',
+    parser.add_argument('--algorithm', type=str, choices=['Follower', 'FollowerLite', 'ccp'], default='ccp',
                         help='Algorithm to use: "Follower" or "FollowerLite" (default: "Follower")')
 
     args = parser.parse_args()
@@ -59,6 +70,8 @@ def main():
 
     if args.algorithm == 'FollowerLite':
         print(run_follower_cpp(create_custom_env(args)))
+    elif args.algorithm == 'ccp':
+        print(run_ccp(create_custom_env(args)))
     else:  # Default to 'Follower'
         print(run_follower(create_custom_env(args)))
 

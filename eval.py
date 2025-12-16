@@ -11,10 +11,8 @@ import yaml
 
 from pogema_toolbox.registry import ToolboxRegistry
 
-from follower.inference import FollowerInference, FollowerInferenceConfig
-from follower.preprocessing import follower_preprocessor
-from follower_cpp.inference import FollowerConfigCPP, FollowerInferenceCPP
-from follower_cpp.preprocessing import follower_cpp_preprocessor
+from ccp.inference import CCPInference, CCPInferenceConfig
+from ccp.preprocessing import ccp_preprocessor
 
 PROJECT_NAME = 'pogema-toolbox'
 BASE_PATH = Path('experiments')
@@ -22,11 +20,8 @@ BASE_PATH = Path('experiments')
 
 def main(disable_wandb=False):
     ToolboxRegistry.register_env('Pogema-v0', create_env_base, Environment)
-    ToolboxRegistry.register_algorithm('A*', BatchAStarAgent)
-    ToolboxRegistry.register_algorithm('Follower', FollowerInference, FollowerInferenceConfig,
-                                       follower_preprocessor)
-    ToolboxRegistry.register_algorithm('FollowerLite', FollowerInferenceCPP, FollowerConfigCPP,
-                                       follower_cpp_preprocessor)
+    ToolboxRegistry.register_algorithm('CCP', CCPInference, CCPInferenceConfig,
+                                        ccp_preprocessor)
 
     with open("env/test-maps.yaml", 'r') as f:
         maps_to_register = yaml.safe_load(f)

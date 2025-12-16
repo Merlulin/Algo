@@ -120,7 +120,7 @@ class CCPInference:
         # 设定获取模型权重文件的规则
         # 最新权重文件为 checkpoint_p0，如果config.json中存在policy_index，则使用policy_index对应的权重文件。
         # 最佳权重文件为 best
-        name_prefix = dict(latest="checkpoint", best="best")['best']
+        name_prefix = dict(latest="checkpoint", best="best")[config.load_checkpoint_kind]
         policy_index = 0 if 'policy_index' not in flat_config else flat_config.policy_index
         # 调用获取目录下满足name_prefix规则的模型权重，因为只有一个文件所以自动匹配。
         checkpoints = Learner.get_checkpoints(os.path.join(self.path, f"checkpoint_p{policy_index}"),
