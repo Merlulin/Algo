@@ -1,0 +1,1952 @@
+diff --git a/README.md b/README.md
+index e957e95..5017642 100644
+--- a/README.md
++++ b/README.md
+@@ -76,6 +76,16 @@ To train **Follower** from scratch, use the following command:
+ python3 main.py  --actor_critic_share_weights=True --batch_size=16384 --env=PogemaMazes-v0 --exploration_loss_coeff=0.023 --extra_fc_layers=1 --gamma=0.9756 --hidden_size=512 --intrinsic_target_reward=0.01 --learning_rate=0.00022 --lr_schedule=constant --network_input_radius=5 --num_filters=64 --num_res_blocks=8 --num_workers=8 --optimizer=adam --ppo_clip_ratio=0.2   --train_for_env_steps=1000000000 --use_rnn=True
+ ```
+ 
++低训练量和低Batch Size：
++```bash
++python3 main.py  --actor_critic_share_weights=True --batch_size=4096 --env=PogemaMazes-v0 --exploration_loss_coeff=0.023 --extra_fc_layers=1 --gamma=0.9756 --hidden_size=512 --intrinsic_target_reward=0.01 --learning_rate=0.00022 --lr_schedule=constant --network_input_radius=5 --num_filters=64 --num_res_blocks=8 --num_workers=8 --optimizer=adam --ppo_clip_ratio=0.2   --train_for_env_steps=100000000 --use_rnn=True --encoder_arch=cnn_transformer
++```
++
++训练CCP
++```bash
++python3 main.py --actor_critic_share_weights=True --batch_size=4096 --env=PogemaMazes-v0 --exploration_loss_coeff=0.023 --extra_fc_layers=1 --gamma=0.9756 --hidden_size=512 --intrinsic_target_reward=0.01 --learning_rate=0.00022 --lr_schedule=constant --network_input_radius=5 --num_filters=64 --num_res_blocks=8 --num_workers=8 --optimizer=adam --ppo_clip_ratio=0.2   --train_for_env_steps=1000000000 --use_rnn=True --encoder_arch=cnn_transformer
++```
++
+ To train **FollowerLite** from scratch, use the following command:
+ ```bash
+ python3 main.py  --actor_critic_share_weights=True --batch_size=16384 --env=PogemaMazes-v0 --exploration_loss_coeff=0.0156 --extra_fc_layers=0 --gamma=0.9716 --hidden_size=16 --intrinsic_target_reward=0.01 --learning_rate=0.00013 --lr_schedule=kl_adaptive_minibatch --network_input_radius=3 --num_filters=8 --num_res_blocks=1 --num_workers=4 --optimizer=adam --ppo_clip_ratio=0.2     --train_for_env_steps=20000000 --use_rnn=False
+diff --git a/env/create_env.py b/env/create_env.py
+index f4205e2..82b6c1c 100644
+--- a/env/create_env.py
++++ b/env/create_env.py
+@@ -17,85 +17,251 @@ from follower.preprocessing import wrap_preprocessors, PreprocessorConfig
+ 
+ 
+ class ProvideGlobalObstacles(gymnasium.Wrapper):
++    '''
++    全局信息提供包装器，为环境添加获取全局障碍物和智能体位置的方法。
++    
++    作用：
++    - 在部分可观测（POMAPF）环境中，智能体通常只能看到局部观测
++    - 某些算法（如C++版本的Follower）需要全局地图信息来进行路径规划
++    - 这个包装器提供了访问全局信息的接口，而不改变环境的基本行为
++    
++    提供的方法：
++    - get_global_obstacles(): 获取整个地图的障碍物布局（二维列表）
++    - get_global_agents_xy(): 获取所有智能体的当前位置坐标
++    
++    使用场景：
++    - 在follower_cpp/preprocessing.py中的ProvideMapWrapper会调用这些方法
++    - 将全局信息添加到观测中，供C++推理算法使用
++    '''
+     def get_global_obstacles(self):
++        '''
++        获取全局障碍物地图。
++        
++        返回:
++            二维列表，表示整个地图的障碍物布局（1表示障碍物，0表示可通过）
++        '''
+         return self.grid.get_obstacles().astype(int).tolist()
+ 
+     def get_global_agents_xy(self):
++        '''
++        获取所有智能体的全局坐标位置。
++        
++        返回:
++            智能体坐标列表，每个元素是(x, y)坐标元组
++        '''
+         return self.grid.get_agents_xy()
+ 
+ 
+ def create_env_base(config: Environment):
+-    env = pogema_v0(grid_config=config.grid_config)
+-    env = ProvideGlobalObstacles(env)
++    '''
++    创建基础环境实例，应用必要的包装器。
++    
++    工作流程（按顺序应用包装器）：
++    1. 创建Pogema基础环境（pogema_v0）
++    2. 添加ProvideGlobalObstacles包装器：提供全局信息访问接口
++    3. 如果use_maps=True：添加MultiMapWrapper，支持多地图课程学习训练
++    4. 如果with_animation=True：添加AnimationMonitor，保存动画到renders目录
++    5. 添加RuntimeMetricWrapper：记录环境运行时间指标
++    
++    包装器应用顺序很重要：
++    - 内层包装器会先处理环境交互
++    - 外层包装器可以访问内层包装器的功能
++    - 例如：RuntimeMetricWrapper在最外层，可以测量整个环境（包括动画）的运行时间
++    
++    参数:
++        config: Environment配置对象，包含环境的所有配置参数（地图、智能体、动画等）
++    
++    返回:
++        完整配置的环境实例，已应用所有必要的包装器
++    
++    使用场景：
++    - 在follower/register_env.py中被create_env()调用
++    - 在example.py中直接调用创建推理环境
++    '''
++    env = pogema_v0(grid_config=config.grid_config)  # 创建pogema基础环境
++    env = ProvideGlobalObstacles(env)  # 添加全局信息访问接口
+     if config.use_maps:
+-        env = MultiMapWrapper(env)
++        env = MultiMapWrapper(env)  # 支持多地图训练（根据map_name模式匹配）
+     if config.with_animation:
+-        env = AnimationMonitor(env, AnimationConfig(directory='renders', egocentric_idx=None))
++        env = AnimationMonitor(env, AnimationConfig(directory='renders', egocentric_idx=None))  # 保存动画到renders目录下
+ 
+     # adding runtime metrics
+-    env = RuntimeMetricWrapper(env)
++    env = RuntimeMetricWrapper(env)  # 记录运行时间指标
+ 
+     return env
+ 
+ 
+ class RuntimeMetricWrapper(gymnasium.Wrapper):
++    '''
++    运行时指标包装器，记录环境的运行时间统计信息。
++    
++    作用：
++    - 测量每个回合的总运行时间（不包括环境step的时间）
++    - 将运行时间作为指标添加到infos字典中，用于性能分析和日志记录
++    - 帮助识别环境性能瓶颈和优化机会
++    
++    工作原理：
++    - reset时：记录回合开始时间，重置step时间累计器
++    - step时：累计每次step的执行时间（环境计算时间，不包括重置时间）
++    - 回合结束时：计算总运行时间（当前时间 - 开始时间 - 累计step时间），添加到metrics中
++    
++    时间统计说明：
++    - runtime = 总时间 - 环境step累计时间
++    - 这个runtime主要反映环境的初始化、重置等开销，不包括step计算时间
++    
++    使用场景：
++    - 训练和评估时自动记录，用于性能监控
++    - 在wandb或日志中可以看到每个回合的运行时间指标
++    '''
+     def __init__(self, env):
+         super().__init__(env)
+-        self._start_time = None
+-        self._env_step_time = None
++        self._start_time = None  # 回合开始时间
++        self._env_step_time = None  # 累计的环境step执行时间
+ 
+     def step(self, actions):
++        '''
++        执行一步环境交互，记录step执行时间。
++        
++        当回合结束时（所有智能体terminated或truncated），计算总运行时间
++        并将其添加到infos[0]['metrics']['runtime']中。
++        
++        参数:
++            actions: 智能体动作列表
++        
++        返回:
++            标准的gymnasium step返回值，infos中包含runtime指标（如果回合结束）
++        '''
+         env_step_start = time.monotonic()
+         observations, rewards, terminated, truncated, infos = self.env.step(actions)
+         env_step_end = time.monotonic()
+-        self._env_step_time += env_step_end - env_step_start
++        self._env_step_time += env_step_end - env_step_start  # 累计step执行时间
+         if all(terminated) or all(truncated):
++            # 回合结束，计算总运行时间（不包括step时间）
+             final_time = time.monotonic() - self._start_time - self._env_step_time
+             if 'metrics' not in infos[0]:
+                 infos[0]['metrics'] = {}
+-            infos[0]['metrics'].update(runtime=final_time)
++            infos[0]['metrics'].update(runtime=final_time)  # 添加到指标字典
+         return observations, rewards, terminated, truncated, infos
+ 
+     def reset(self, **kwargs):
++        '''
++        重置环境，初始化时间统计。
++        
++        参数:
++            **kwargs: 重置参数
++        
++        返回:
++            重置后的观测
++        '''
+         obs = self.env.reset(**kwargs)
+-        self._start_time = time.monotonic()
+-        self._env_step_time = 0.0
++        self._start_time = time.monotonic()  # 记录回合开始时间
++        self._env_step_time = 0.0  # 重置step时间累计器
+         return obs
+ 
+ 
+ class MultiMapWrapper(gymnasium.Wrapper):
++    '''
++    多地图包装器，支持在多张地图上进行训练和评估。
++    
++    主要用途：
++    - 数据增强：通过在多张不同的地图上训练，提高模型的泛化能力
++    - 课程学习：可以逐步增加地图难度
++    - 随机化训练：每次reset时随机选择地图，增加训练的多样性
++    
++    工作原理：
++    - 初始化时：根据grid_config.map_name的正则表达式模式，从MAPS_REGISTRY中匹配所有符合条件的地图
++    - reset时：从匹配的地图列表中随机选择一张地图，更新环境配置并重置环境
++    - 使用独立的随机数生成器，确保地图选择的随机性不受其他随机操作影响
++    
++    地图匹配机制：
++    - 使用正则表达式匹配：grid_config.map_name可以是正则表达式模式
++    - 例如：map_name='mazes-.+' 会匹配所有以'mazes-'开头的迷宫地图
++    - 例如：map_name='(mazes-s[0-9]_|mazes-s[1-3][0-9]_)' 匹配mazes-s0到mazes-s39的地图
++    
++    使用场景：
++    - 训练时：enable use_maps=True，在多个地图上随机训练
++    - 评估时：可以指定特定的地图列表进行评估
++    
++    注意事项：
++    - 如果没有匹配到任何地图，会抛出KeyError异常
++    - 每次reset都会随机选择地图，确保训练过程中的多样性
++    '''
+     def __init__(self, env):
++        '''
++        初始化多地图包装器，根据map_name模式匹配所有符合条件的地图。
++        
++        工作流程：
++        1. 从环境配置中获取map_name正则表达式模式
++        2. 遍历MAPS_REGISTRY中的所有地图，使用re.match匹配
++        3. 为每个匹配的地图创建GridConfig配置对象
++        4. 将所有匹配的地图配置保存在self._configs列表中
++        '''
+         super().__init__(env)
+-        self._configs = []
+-        self._rnd = np.random.default_rng(self.grid_config.seed)
+-        pattern = self.grid_config.map_name
++        self._configs = []  # 存储所有匹配的地图配置
++        self._rnd = np.random.default_rng(self.grid_config.seed)  # 随机数生成器
++        pattern = self.grid_config.map_name  # 获取地图名称的正则表达式模式
+ 
+         if pattern:
++            # 遍历地图注册表，匹配符合pattern的地图
+             for map_name in sorted(MAPS_REGISTRY):
+                 if re.match(pattern, map_name):
+                     cfg = deepcopy(self.grid_config)
+-                    cfg.map = MAPS_REGISTRY[map_name]
+-                    cfg.map_name = map_name
+-                    cfg = GridConfig(**cfg.dict())
++                    cfg.map = MAPS_REGISTRY[map_name]  # 设置具体的地图数据
++                    cfg.map_name = map_name  # 设置具体的地图名称
++                    cfg = GridConfig(**cfg.dict())  # 转换为GridConfig对象
+                     self._configs.append(cfg)
+             if not self._configs:
+-                raise KeyError(f"No map matching: {pattern}")
++                raise KeyError(f"No map matching: {pattern}")  # 没有匹配到任何地图
+ 
+     def reset(self, seed=None, **kwargs):
+-        self._rnd = np.random.default_rng(seed)
++        '''
++        重置环境，随机选择一张地图并更新环境配置。
++        
++        工作流程：
++        1. 使用新的seed初始化随机数生成器
++        2. 从匹配的地图列表中随机选择一张地图
++        3. 更新环境的grid_config为选中的地图配置
++        4. 调用底层环境的reset方法重置环境
++        
++        参数:
++            seed: 随机种子，用于确保可复现性
++            **kwargs: 其他重置参数
++        
++        返回:
++            重置后的观测信息
++        
++        注意：
++        - 每次reset都会选择不同的地图（随机），增加训练多样性
++        - seed参数会影响地图选择的随机性，相同seed会产生相同的选择序列
++        '''
++        self._rnd = np.random.default_rng(seed)  # 使用新的seed初始化随机数生成器
+         if self._configs is not None and len(self._configs) >= 1:
+-            map_idx = self._rnd.integers(0, len(self._configs))
+-            cfg = deepcopy(self._configs[map_idx])
+-            self.env.unwrapped.grid_config = cfg
+-            self.env.unwrapped.grid_config.seed = seed
+-        return self.env.reset(seed=seed, **kwargs)
++            map_idx = self._rnd.integers(0, len(self._configs))  # 随机选择地图索引
++            cfg = deepcopy(self._configs[map_idx])  # 复制选中的地图配置
++            self.env.unwrapped.grid_config = cfg  # 更新环境的网格配置
++            self.env.unwrapped.grid_config.seed = seed  # 设置地图的随机种子
++        return self.env.reset(seed=seed, **kwargs)  # 重置环境
+ 
+ 
+ def main():
+-    env = create_env_base(config=Environment())
+-    env = wrap_preprocessors(env, config=PreprocessorConfig())
+-    env.reset()
+-    env.render()
++    '''
++    测试函数，用于验证环境创建和基本功能。
++    
++    功能：
++    - 创建默认配置的环境实例
++    - 应用预处理包装器
++    - 重置环境
++    - 渲染环境（如果支持）
++    
++    使用方式：
++    - 直接运行此文件：python env/create_env.py
++    - 用于快速测试环境是否正常工作
++    - 调试环境配置和包装器是否正确应用
++    '''
++    env = create_env_base(config=Environment())  # 创建基础环境
++    env = wrap_preprocessors(env, config=PreprocessorConfig())  # 应用预处理包装器
++    env.reset()  # 重置环境
++    env.render()  # 渲染环境（如果支持）
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/example.py b/example.py
+index 89dda76..4b187a2 100644
+--- a/example.py
++++ b/example.py
+@@ -1,6 +1,6 @@
+ import argparse
+ 
+-from env.create_env import create_env_base
++from env.create_env import create_env_base  
+ from env.custom_maps import MAPS_REGISTRY
+ from utils.eval_utils import run_episode
+ from follower.training_config import EnvironmentMazes
+@@ -9,6 +9,8 @@ from follower.preprocessing import follower_preprocessor
+ from follower_cpp.inference import FollowerConfigCPP, FollowerInferenceCPP
+ from follower_cpp.preprocessing import follower_cpp_preprocessor
+ 
++from ccp.inference import CCPInferenceConfig, CCPInference
++from ccp.preprocessing import ccp_preprocessor
+ 
+ def create_custom_env(cfg):
+     env_cfg = EnvironmentMazes(with_animation=cfg.animation)
+@@ -19,6 +21,15 @@ def create_custom_env(cfg):
+     return create_env_base(env_cfg)
+ 
+ 
++def run_ccp(env):
++    follower_cfg = CCPInferenceConfig()
++    algo = CCPInference(follower_cfg)
++
++    env = ccp_preprocessor(env, follower_cfg)
++
++    return run_episode(env, algo)
++
++
+ def run_follower(env):
+     follower_cfg = FollowerInferenceConfig()
+     algo = FollowerInference(follower_cfg)
+@@ -47,7 +58,7 @@ def main():
+                         help='Maximum episode steps (default: %(default)d)')
+     parser.add_argument('--show_map_names', action='store_true', help='Shows names of all available maps')
+ 
+-    parser.add_argument('--algorithm', type=str, choices=['Follower', 'FollowerLite'], default='Follower',
++    parser.add_argument('--algorithm', type=str, choices=['Follower', 'FollowerLite', 'ccp'], default='Follower',
+                         help='Algorithm to use: "Follower" or "FollowerLite" (default: "Follower")')
+ 
+     args = parser.parse_args()
+@@ -59,6 +70,8 @@ def main():
+ 
+     if args.algorithm == 'FollowerLite':
+         print(run_follower_cpp(create_custom_env(args)))
++    elif args.algorithm == 'ccp':
++        print(run_ccp(create_custom_env(args)))
+     else:  # Default to 'Follower'
+         print(run_follower(create_custom_env(args)))
+ 
+diff --git a/experiments/01-random-20x20/01-random-20x20.yaml b/experiments/01-random-20x20/01-random-20x20.yaml
+index f274e15..bcacc44 100644
+--- a/experiments/01-random-20x20/01-random-20x20.yaml
++++ b/experiments/01-random-20x20/01-random-20x20.yaml
+@@ -32,6 +32,11 @@ algorithms:
+     num_process: 4
+     parallel_backend: 'balanced_dask'
+ 
++  CCP:
++  name: CCP
++  num_process: 4
++  parallel_backend: 'balanced_dask'
++
+   FollowerLite:
+     name: FollowerLite
+     num_process: 4
+diff --git a/experiments/02-mazes/02-mazes.yaml b/experiments/02-mazes/02-mazes.yaml
+index 5f62210..01ce239 100644
+--- a/experiments/02-mazes/02-mazes.yaml
++++ b/experiments/02-mazes/02-mazes.yaml
+@@ -28,6 +28,11 @@ algorithms:
+     num_process: 4
+     parallel_backend: 'balanced_dask'
+ 
++  CCP:
++    name: CCP
++    num_process: 4
++    parallel_backend: 'balanced_dask'
++
+   FollowerLite:
+     name: FollowerLite
+     num_process: 4
+diff --git a/experiments/03-den520d/03-den520d.yaml b/experiments/03-den520d/03-den520d.yaml
+index b9ac55d..5f1b75d 100644
+--- a/experiments/03-den520d/03-den520d.yaml
++++ b/experiments/03-den520d/03-den520d.yaml
+@@ -16,6 +16,11 @@ algorithms:
+     num_process: 4
+     parallel_backend: 'balanced_dask'
+ 
++  CCP:
++    name: CCP
++    num_process: 4
++    parallel_backend: 'balanced_dask'
++
+   FollowerLite:
+     name: FollowerLite
+     num_process: 4
+diff --git a/experiments/04-Paris_1/04-Paris_1.yaml b/experiments/04-Paris_1/04-Paris_1.yaml
+index 7b98c6d..3e2e835 100644
+--- a/experiments/04-Paris_1/04-Paris_1.yaml
++++ b/experiments/04-Paris_1/04-Paris_1.yaml
+@@ -16,6 +16,11 @@ algorithms:
+     num_process: 4
+     parallel_backend: 'balanced_dask'
+ 
++  CCP:
++    name: CCP
++    num_process: 4
++    parallel_backend: 'balanced_dask'
++
+   FollowerLite:
+     name: FollowerLite
+     num_process: 4
+diff --git a/follower/inference.py b/follower/inference.py
+index 39c7794..5615028 100644
+--- a/follower/inference.py
++++ b/follower/inference.py
+@@ -119,9 +119,13 @@ class FollowerInference:
+             log.warning('CUDA is not available, using CPU. This might be slow.')
+ 
+         actor_critic.model_to_device(device)
+-        name_prefix = dict(latest="checkpoint", best="best")['latest']
+-        policy_index = 0 if 'policy_index' not in flat_config else flat_config.policy_index
+ 
++        # 设定获取模型权重文件的规则
++        # 最新权重文件为 checkpoint_p0，如果config.json中存在policy_index，则使用policy_index对应的权重文件。
++        # 最佳权重文件为 best
++        name_prefix = dict(latest="checkpoint", best="best")['best']
++        policy_index = 0 if 'policy_index' not in flat_config else flat_config.policy_index
++        # 调用获取目录下满足name_prefix规则的模型权重，因为只有一个文件所以自动匹配。
+         checkpoints = Learner.get_checkpoints(os.path.join(self.path, f"checkpoint_p{policy_index}"),
+                                               f"{name_prefix}_*")
+ 
+diff --git a/follower/model.py b/follower/model.py
+index 9ca4352..48934fb 100644
+--- a/follower/model.py
++++ b/follower/model.py
+@@ -13,103 +13,310 @@ from torch import nn as nn
+ 
+ 
+ class EncoderConfig(BaseModel):
+-    """
+-    Configuration for an encoder.
+-
+-    Args:
+-        extra_fc_layers (int): Number of extra fully connected (fc) layers. Default is 0.
+-        num_filters (int): Number of filters. Default is 64.
+-        num_res_blocks (int): Number of residual blocks. Default is 1.
+-        activation_func (Literal['ReLU', 'ELU']): Activation function to use. Default is 'ReLU'.
+-        hidden_size (int): Hidden size for extra fc layers. Default is 128.
+-    """
+-    extra_fc_layers: int = 0
+-    num_filters: int = 64
+-    num_res_blocks: int = 1
+-    activation_func: Literal['ReLU', 'ELU', 'Mish'] = 'ReLU'
+-    hidden_size: int = 128
++    '''
++    编码器配置类，定义ResNet编码器的架构参数。
++    
++    编码器的作用：
++    - 将预处理后的观测（形状为(channels, height, width)的obs张量）转换为特征向量
++    - 作为Actor-Critic网络的输入层，提取观测的空间特征
++    - 在Sample Factory框架中，编码器输出的特征会传递给策略网络和价值网络
++    
++    参数说明：
++    - num_filters: 卷积层的滤波器数量，决定特征图的通道数
++      默认64，实际训练中Follower使用64，FollowerLite使用8
++    - num_res_blocks: ResNet中残差块的数量，决定网络的深度
++      默认1，实际训练中Follower使用8，FollowerLite使用1
++    - activation_func: 激活函数类型，'ReLU'、'ELU'或'Mish'
++      ReLU是最常用的，ELU在某些情况下性能更好，Mish是较新的激活函数
++    - extra_fc_layers: 额外的全连接层数量（在卷积层之后）
++      默认0表示不使用额外的全连接层
++      实际训练中Follower使用1层（将卷积输出投影到hidden_size）
++    - hidden_size: 额外全连接层的隐藏层维度
++      默认128，实际训练中Follower使用512
++      仅在extra_fc_layers > 0时使用
++    
++    实际训练配置示例：
++    - Follower: num_filters=64, num_res_blocks=8, extra_fc_layers=1, hidden_size=512
++    - FollowerLite: num_filters=8, num_res_blocks=1, extra_fc_layers=0
++    '''
++    encoder_arch: Literal['resnet', 'cnn_transformer'] = 'resnet'
++    extra_fc_layers: int = 0  # 额外全连接层数量，默认0（不使用）
++    num_filters: int = 64  # 卷积层滤波器数量，决定特征图通道数
++    num_res_blocks: int = 1  # ResNet残差块数量，决定网络深度
++    activation_func: Literal['ReLU', 'ELU', 'Mish'] = 'ReLU'  # 激活函数类型
++    hidden_size: int = 128  # 额外全连接层的隐藏层维度（仅在extra_fc_layers>0时使用）
++
++    transformer_num_layers: int = 2
++    transformer_nhead: int = 4
++    transformer_dim_feedforward: int = 256
++    transformer_dropout: float = 0.0
++    transformer_use_cls_token: bool = False
+ 
+ 
+ def activation_func(cfg: EncoderConfig) -> nn.Module:
+-    """
+-    Returns an instance of nn.Module representing the activation function specified in the configuration.
+-
+-    Args:
+-        cfg (EncoderConfig): Encoder configuration.
+-
+-    Returns:
+-        nn.Module: Instance of nn.Module representing the activation function.
+-
+-    Raises:
+-        Exception: If the activation function specified in the configuration is unknown.
+-    """
++    '''
++    激活函数工厂函数，根据配置返回对应的PyTorch激活函数模块。
++    
++    作用：
++    - 根据EncoderConfig中的activation_func参数，返回对应的激活函数
++    - 所有激活函数使用inplace=True，节省内存（直接修改输入而不创建新张量）
++    
++    支持的激活函数：
++    - ReLU (Rectified Linear Unit): 最常用的激活函数，计算简单，梯度稳定
++    - ELU (Exponential Linear Unit): 输出可以是负值，可能在某些情况下性能更好
++    - Mish: 较新的平滑激活函数，在某些任务上表现优于ReLU
++    
++    参数:
++        cfg: 编码器配置对象，包含activation_func参数
++    
++    返回:
++        PyTorch激活函数模块（nn.Module）
++    
++    抛出异常:
++        Exception: 如果配置中指定的激活函数未知
++    '''
+     if cfg.activation_func == "ELU":
+-        return nn.ELU(inplace=True)
++        return nn.ELU(inplace=True)  # 指数线性单元
+     elif cfg.activation_func == "ReLU":
+-        return nn.ReLU(inplace=True)
++        return nn.ReLU(inplace=True)  # 修正线性单元（最常用）
+     elif cfg.activation_func == "Mish":
+-        return nn.Mish(inplace=True)
++        return nn.Mish(inplace=True)  # Mish激活函数
+     else:
+-        raise Exception("Unknown activation_func")
++        raise Exception("Unknown activation_func")  # 未知的激活函数类型
+ 
+ 
+ class ResBlock(nn.Module):
+-    """
+-    Residual block in the encoder.
+-
+-    Args:
+-        cfg (EncoderConfig): Encoder configuration.
+-        input_ch (int): Input channel size.
+-        output_ch (int): Output channel size.
+-    """
++    '''
++    ResNet残差块（Residual Block），ResNet编码器的核心组件。
++    
++    残差连接的作用：
++    - 解决深度网络的梯度消失问题，使网络可以训练得更深
++    - 通过恒等映射（identity mapping）允许梯度直接传播
++    - 提高网络的表达能力和训练稳定性
++    
++    结构设计：
++    - 标准残差块：激活 → 卷积 → 激活 → 卷积 → 残差连接
++    - 使用3x3卷积核，stride=1，padding=1（保持空间尺寸不变）
++    - 输入和输出的通道数相同（input_ch == output_ch），便于残差连接
++    
++    前向传播：
++    - out = activation(conv(activation(conv(x)))) + x
++    - 残差连接要求输入和输出形状相同
++    
++    参数:
++        cfg: 编码器配置对象，用于确定激活函数类型
++        input_ch: 输入通道数
++        output_ch: 输出通道数（通常与input_ch相同）
++    '''
+ 
+     def __init__(self, cfg: EncoderConfig, input_ch, output_ch):
++        '''
++        初始化残差块，构建卷积层序列。
++        
++        构建的层序列：
++        1. 激活函数
++        2. 第一个3x3卷积（input_ch → output_ch）
++        3. 激活函数
++        4. 第二个3x3卷积（output_ch → output_ch，保持通道数）
++        '''
+         super().__init__()
+ 
+         layers = [
+-            activation_func(cfg),
+-            nn.Conv2d(input_ch, output_ch, kernel_size=3, stride=1, padding=1),
+-            activation_func(cfg),
+-            nn.Conv2d(output_ch, output_ch, kernel_size=3, stride=1, padding=1),
++            activation_func(cfg),  # 第一个激活函数
++            nn.Conv2d(input_ch, output_ch, kernel_size=3, stride=1, padding=1),  # 第一个卷积层
++            activation_func(cfg),  # 第二个激活函数
++            nn.Conv2d(output_ch, output_ch, kernel_size=3, stride=1, padding=1),  # 第二个卷积层
++            activation_func(cfg),  # 第三个激活函数
++            nn.Conv2d(output_ch, output_ch, kernel_size=3, stride=1, padding=1),  # 第三个卷积层
+         ]
+ 
+-        self.res_block_core = nn.Sequential(*layers)
++        self.res_block_core = nn.Sequential(*layers)  # 残差块的核心层序列
+ 
+     def forward(self, x):
+-        identity = x
+-        out = self.res_block_core(x)
+-        out = out + identity
++        '''
++        前向传播，实现残差连接。
++        
++        参数:
++            x: 输入张量，形状为(batch, channels, height, width)
++        
++        返回:
++            输出张量，形状与输入相同（通过残差连接保持）
++        '''
++        identity = x  # 保存输入作为残差连接的恒等映射
++        out = self.res_block_core(x)  # 通过卷积层序列
++        out = out + identity  # 残差连接：添加恒等映射
+         return out
+ 
+ 
+ class ResnetEncoder(Encoder):
+-    """
+-    ResNet-based encoder.
+-
+-    Args:
+-        cfg (Config): Configuration.
+-        obs_space (ObsSpace): Observation space.
+-    """
++    '''
++    ResNet编码器，将观测张量转换为特征向量，用于Actor-Critic网络。
++    
++    架构组成：
++    1. 卷积头（conv_head）：
++       - 初始卷积层：将输入通道数转换为num_filters
++       - 多个残差块：提取空间特征（数量由num_res_blocks决定）
++       - 最终激活函数
++    2. 可选的全连接层（extra_linear）：
++       - 如果extra_fc_layers > 0，添加全连接层进行特征投影
++       - 将卷积输出的展平特征投影到hidden_size维度
++    
++    输入格式：
++    - 观测字典，必须包含'obs'键
++    - obs的形状：(channels, height, width)，其中channels由预处理阶段确定
++      （如obstacles、agents等位置特征的数量）
++    
++    输出格式：
++    - 特征向量，形状为(batch_size, encoder_out_size)
++    - 可以直接输入到Actor-Critic网络的策略头和价值头
++    
++    在Sample Factory中的作用：
++    - 作为自定义编码器，在register_training_utils.py中注册
++    - Sample Factory框架会使用此编码器处理观测
++    - 编码器输出会传递给RNN（如果use_rnn=True）或直接传递给策略/价值网络
++    
++    实际训练配置：
++    - Follower: 8个残差块，64个滤波器，1层全连接（512维）
++    - FollowerLite: 1个残差块，8个滤波器，无全连接层（更轻量）
++    '''
+ 
+     def __init__(self, cfg: Config, obs_space: ObsSpace):
++        '''
++        初始化ResNet编码器，构建网络架构。
++        
++        工作流程：
++        1. 从配置中提取编码器配置
++        2. 确定输入通道数（从obs_space['obs']的形状获取）
++        3. 构建卷积头：初始卷积 + 残差块序列
++        4. 计算卷积头输出大小
++        5. 如果配置了extra_fc_layers，构建额外的全连接层
++        
++        参数:
++            cfg: Sample Factory配置对象，包含encoder配置
++            obs_space: 观测空间定义，用于确定输入形状
++        '''
+         super().__init__(cfg)
+-        self.encoder_cfg: EncoderConfig = EncoderConfig(**cfg.encoder)
++        self.encoder_cfg: EncoderConfig = EncoderConfig(**cfg.encoder)  # 解析编码器配置
+ 
+-        input_ch = obs_space['obs'].shape[0]
+-        resnet_conf = [[self.encoder_cfg.num_filters, self.encoder_cfg.num_res_blocks]]
++        input_ch = obs_space['obs'].shape[0]  # 输入通道数（来自预处理阶段拼接的特征数）
++        resnet_conf = [[self.encoder_cfg.num_filters, self.encoder_cfg.num_res_blocks]]  # 配置：[(输出通道数, 残差块数量)]
+         curr_input_channels = input_ch
+         layers = []
+ 
++        # 构建卷积层和残差块
+         for out_channels, res_blocks in resnet_conf:
++            # 初始卷积层：将输入通道数转换为目标通道数
+             layers.extend([nn.Conv2d(curr_input_channels, out_channels, kernel_size=3, stride=1, padding=1)])
++            # 添加指定数量的残差块
+             layers.extend([ResBlock(self.encoder_cfg, out_channels, out_channels) for _ in range(res_blocks)])
+             curr_input_channels = out_channels
+ 
+-        layers.append(activation_func(self.encoder_cfg))
+-        self.conv_head = nn.Sequential(*layers)
++        layers.append(activation_func(self.encoder_cfg))  # 最终激活函数
++        self.conv_head = nn.Sequential(*layers)  # 卷积头：所有卷积层和残差块的序列
++        # 计算卷积头输出的展平后大小（用于确定全连接层输入维度）
+         self.conv_head_out_size = calc_num_elements(self.conv_head, obs_space['obs'].shape)
+-        self.encoder_out_size = self.conv_head_out_size
++        self.encoder_out_size = self.conv_head_out_size  # 编码器输出大小（如果无全连接层）
+ 
++        # 如果配置了额外的全连接层，构建投影层
++        if self.encoder_cfg.extra_fc_layers:
++            self.extra_linear = nn.Sequential(
++                nn.Linear(self.encoder_out_size, self.encoder_cfg.hidden_size),  # 线性投影
++                activation_func(self.encoder_cfg),  # 激活函数
++            )
++            self.encoder_out_size = self.encoder_cfg.hidden_size  # 更新编码器输出大小
++
++        log.debug('Convolutional layer output size: %r', self.conv_head_out_size)  # 记录卷积头输出大小
++
++    def get_out_size(self) -> int:
++        '''
++        获取编码器输出特征的维度大小。
++        
++        返回:
++            编码器输出特征向量的维度（用于构建后续网络层）
++        
++        使用场景：
++        - Sample Factory框架使用此方法确定后续网络层的输入维度
++        - Actor-Critic网络的策略头和价值头需要知道输入特征维度
++        '''
++        return self.encoder_out_size
++
++    def forward(self, x):
++        '''
++        前向传播，将观测转换为特征向量。
++        
++        处理流程：
++        1. 从输入字典中提取'obs'张量
++        2. 通过卷积头提取空间特征
++        3. 展平为特征向量
++        4. 如果配置了额外全连接层，进行特征投影
++        
++        参数:
++            x: 输入字典，必须包含'obs'键
++               obs的形状：(batch_size, channels, height, width)
++        
++        返回:
++            特征向量，形状为(batch_size, encoder_out_size)
++            可以直接输入到后续的策略网络或价值网络
++        '''
++        x = x['obs']  # 提取观测张量
++        x = self.conv_head(x)  # 通过卷积头（初始卷积 + 残差块序列 + 激活）
++        x = x.contiguous().view(-1, self.conv_head_out_size)  # 展平为特征向量
++
++        # 如果配置了额外全连接层，进行特征投影
++        if self.encoder_cfg.extra_fc_layers:
++            x = self.extra_linear(x)
++
++        return x
++
++
++class CNNTransformerEncoder(Encoder):
++    def __init__(self, cfg: Config, obs_space: ObsSpace):
++        super().__init__(cfg)
++        self.encoder_cfg: EncoderConfig = EncoderConfig(**cfg.encoder)
++
++        input_ch = obs_space['obs'].shape[0]
++        h, w = obs_space['obs'].shape[1], obs_space['obs'].shape[2]
++        self.num_tokens = int(h * w)
++
++        d_model = int(self.encoder_cfg.num_filters)
++        nhead = int(self.encoder_cfg.transformer_nhead)
++        if d_model % nhead != 0:
++            log.warning(
++                'transformer_nhead (%d) does not divide d_model (%d), using nhead=1',
++                nhead,
++                d_model,
++            )
++            nhead = 1
++
++        self.cnn = nn.Sequential(
++            nn.Conv2d(input_ch, d_model, kernel_size=3, stride=1, padding=1),
++            activation_func(self.encoder_cfg),
++            nn.Conv2d(d_model, d_model, kernel_size=3, stride=1, padding=1),
++            activation_func(self.encoder_cfg),
++        )
++
++        seq_len = self.num_tokens + (1 if self.encoder_cfg.transformer_use_cls_token else 0)
++        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, d_model))
++        nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
++
++        if self.encoder_cfg.transformer_use_cls_token:
++            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
++            nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
++        else:
++            self.cls_token = None
++
++        layer = nn.TransformerEncoderLayer(
++            d_model=d_model,
++            nhead=nhead,
++            dim_feedforward=int(self.encoder_cfg.transformer_dim_feedforward),
++            dropout=float(self.encoder_cfg.transformer_dropout),
++            activation='gelu',
++            batch_first=True,
++            norm_first=True,
++        )
++        self.transformer = nn.TransformerEncoder(layer, num_layers=int(self.encoder_cfg.transformer_num_layers))
++
++        self.encoder_out_size = d_model
+         if self.encoder_cfg.extra_fc_layers:
+             self.extra_linear = nn.Sequential(
+                 nn.Linear(self.encoder_out_size, self.encoder_cfg.hidden_size),
+@@ -117,15 +324,27 @@ class ResnetEncoder(Encoder):
+             )
+             self.encoder_out_size = self.encoder_cfg.hidden_size
+ 
+-        log.debug('Convolutional layer output size: %r', self.conv_head_out_size)
++        log.debug('CNN-Transformer tokens: %r, d_model: %r', self.num_tokens, d_model)
+ 
+     def get_out_size(self) -> int:
+         return self.encoder_out_size
+ 
+     def forward(self, x):
+         x = x['obs']
+-        x = self.conv_head(x)
+-        x = x.contiguous().view(-1, self.conv_head_out_size)
++        x = self.cnn(x)
++
++        x = x.flatten(2).transpose(1, 2)
++        if self.cls_token is not None:
++            cls = self.cls_token.expand(x.shape[0], -1, -1)
++            x = torch.cat([cls, x], dim=1)
++
++        x = x + self.pos_embed
++        x = self.transformer(x)
++
++        if self.cls_token is not None:
++            x = x[:, 0]
++        else:
++            x = x.mean(dim=1)
+ 
+         if self.encoder_cfg.extra_fc_layers:
+             x = self.extra_linear(x)
+@@ -134,13 +353,31 @@ class ResnetEncoder(Encoder):
+ 
+ 
+ def main():
+-    exp_cfg = {'encoder': EncoderConfig().dict()}
+-    r = 5
+-    obs = torch.rand(1, 3, r * 2 + 1, r * 2 + 1)
+-    q_obs = {'obs': obs}
++    '''
++    测试函数，用于验证ResNet编码器的创建和前向传播。
++    
++    功能：
++    - 创建默认配置的编码器
++    - 使用随机观测测试前向传播
++    - 验证编码器是否能正常工作
++    
++    测试数据：
++    - 观测半径r=5，对应11x11的观测窗口
++    - 3个通道（模拟拼接后的位置特征）
++    - 批量大小为1
++    
++    使用方式：
++    - 直接运行此文件：python follower/model.py
++    - 用于快速测试编码器是否正常工作
++    - 调试编码器配置和前向传播逻辑
++    '''
++    exp_cfg = {'encoder': EncoderConfig().dict()}  # 创建默认编码器配置
++    r = 5  # 观测半径
++    obs = torch.rand(1, 3, r * 2 + 1, r * 2 + 1)  # 创建随机观测（batch=1, channels=3, 11x11）
++    q_obs = {'obs': obs}  # 构建观测字典
+     # noinspection PyTypeChecker
+-    re = ResnetEncoder(Namespace(**exp_cfg), dict(obs=obs[0]))
+-    re(q_obs)
++    re = ResnetEncoder(Namespace(**exp_cfg), dict(obs=obs[0]))  # 创建编码器（使用第一个样本的形状作为obs_space）
++    re(q_obs)  # 前向传播测试
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/follower/preprocessing.py b/follower/preprocessing.py
+index 6a50ff9..31c122a 100644
+--- a/follower/preprocessing.py
++++ b/follower/preprocessing.py
+@@ -7,174 +7,468 @@ from follower.planning import ResettablePlanner, PlannerConfig
+ 
+ 
+ class PreprocessorConfig(PlannerConfig):
+-    network_input_radius: int = 5
+-    intrinsic_target_reward: float = 0.01
++    '''
++    预处理配置类，继承自PlannerConfig，定义了预处理相关的参数。
++    
++    参数说明：
++    - network_input_radius: 网络输入的观测半径（网格单元数），决定神经网络接收的观测范围
++      默认5表示11x11的观测窗口（2*5+1）
++    - intrinsic_target_reward: 内在奖励值，当智能体到达子目标（subgoal）时给予的奖励
++      用于鼓励智能体跟随路径规划器提供的路径点
++    
++    继承的参数（来自PlannerConfig）：
++    - use_static_cost: 是否使用静态代价（障碍物惩罚）
++    - use_dynamic_cost: 是否使用动态代价（其他智能体位置惩罚）
++    - reset_dynamic_cost: 是否在重置时重置动态代价
++    '''
++    network_input_radius: int = 5  # 网络输入的观测半径，默认5（11x11观测窗口）
++    intrinsic_target_reward: float = 0.01  # 到达子目标时的内在奖励值
+ 
+ 
+ def follower_preprocessor(env, algo_config):
++    '''
++    Follower算法的预处理函数，是预处理的主要入口点。
++    
++    作用：
++    - 从algo_config中提取预处理配置
++    - 调用wrap_preprocessors应用所有预处理包装器
++    - 返回预处理后的环境
++    
++    参数:
++        env: 基础环境实例（已经过create_env_base处理）
++        algo_config: 算法配置对象，包含training_config.preprocessing配置
++    
++    返回:
++        预处理后的环境实例，已应用所有Follower特有的预处理包装器
++    
++    使用场景：
++    - 在example.py中用于推理时的环境预处理
++    - 在eval.py中注册算法时使用
++    '''
+     env = wrap_preprocessors(env, algo_config.training_config.preprocessing)
+     return env
+ 
+ 
+ def wrap_preprocessors(env, config: PreprocessorConfig, auto_reset=False):
+-    env = FollowerWrapper(env=env, config=config)
+-    env = CutObservationWrapper(env, target_observation_radius=config.network_input_radius)
+-    env = ConcatPositionalFeatures(env)
++    '''
++    应用所有预处理包装器的核心函数，按照固定顺序包装环境。
++    
++    包装器应用顺序（从内到外）：
++    1. FollowerWrapper: 核心包装器，添加路径规划和内在奖励机制
++    2. CutObservationWrapper: 裁剪观测到网络输入大小
++    3. ConcatPositionalFeatures: 拼接多个位置特征为单一obs张量
++    4. AutoResetWrapper: 可选，自动重置环境（训练时使用）
++    
++    重要说明：
++    - 包装器顺序很重要：内层包装器先处理观测，外层包装器对处理后的观测进行操作
++    - FollowerWrapper在最内层，因为它需要原始的观测进行路径规划
++    - CutObservationWrapper和ConcatPositionalFeatures在外层，对规划后的观测进行格式转换
++    
++    参数:
++        env: 基础环境实例
++        config: 预处理配置对象
++        auto_reset: 是否启用自动重置（训练时通常为True，推理时为False）
++    
++    返回:
++        完全预处理后的环境实例，可以直接用于训练或推理
++    
++    使用场景：
++    - 训练时：在register_env.py的create_env()中调用，auto_reset=True
++    - 推理时：在follower_preprocessor中调用，auto_reset=False
++    '''
++    env = FollowerWrapper(env=env, config=config)  # 添加路径规划和内在奖励
++    env = CutObservationWrapper(env, target_observation_radius=config.network_input_radius)  # 裁剪观测大小
++    env = ConcatPositionalFeatures(env)  # 拼接位置特征
+     if auto_reset:
+-        env = AutoResetWrapper(env)
++        env = AutoResetWrapper(env)  # 自动重置（训练时使用）
+     return env
+ 
+ 
+ class FollowerWrapper(ObservationWrapper):
++    '''
++    Follower算法的核心包装器，实现了路径规划和内在奖励机制。
++    
++    核心功能：
++    1. 路径规划：使用ResettablePlanner为每个智能体计算到目标的最短路径
++    2. 子目标设置：将路径上的下一个点作为子目标，指导智能体移动
++    3. 路径可视化：在观测中将规划路径标记为+1.0，障碍物标记为-1.0
++    4. 内在奖励：当智能体到达子目标时给予奖励，鼓励跟随路径
++    
++    工作原理（"Learn to Follow"算法的关键）：
++    - 使用A*等路径规划算法计算全局最优路径
++    - 将长距离路径分解为短距离的子目标序列
++    - 通过内在奖励引导智能体学习跟随路径规划器
++    - 最终训练出的策略能够在无需规划器的情况下做出类似决策
++    
++    观测修改：
++    - obstacles数组中：障碍物值从1变为-1，路径点设置为+1
++    - 这样神经网络可以区分障碍物、路径和自由空间
++    
++    奖励修改：
++    - 将环境奖励替换为内在奖励（到达子目标时给予intrinsic_target_reward）
++    - 这实现了"Learning to Follow"的核心思想：模仿路径规划器的行为
++    '''
+ 
+     def __init__(self, env, config: PreprocessorConfig):
+         super().__init__(env)
+         self._cfg: PreprocessorConfig = config
+-        self.re_plan = ResettablePlanner(self._cfg)
+-        self.prev_goals = None
+-        self.intrinsic_reward = None
++        self.re_plan = ResettablePlanner(self._cfg)  # 可重置的路径规划器
++        self.prev_goals = None  # 上一帧的子目标列表
++        self.intrinsic_reward = None  # 内在奖励列表
+ 
+     @staticmethod
+     def get_relative_xy(x, y, tx, ty, obs_radius):
++        '''
++        将全局坐标转换为相对于智能体的局部观测坐标。
++        
++        坐标转换规则：
++        - 智能体位于观测窗口的中心 (obs_radius, obs_radius)
++        - 如果目标点超出观测范围，返回None
++        - 转换公式：局部x = obs_radius - (全局x - 智能体x)
++        
++        参数:
++            x, y: 智能体的全局坐标
++            tx, ty: 目标点的全局坐标
++            obs_radius: 观测半径
++        
++        返回:
++            (局部x, 局部y) 或 (None, None) 如果目标超出范围
++        '''
+         dx, dy = x - tx, y - ty
+         if dx > obs_radius or dx < -obs_radius or dy > obs_radius or dy < -obs_radius:
+             return None, None
+         return obs_radius - dx, obs_radius - dy
+ 
+     def observation(self, observations):
+-        # Update cost penalties based on the current observations, independently for each agent.
++        '''
++        核心观测处理方法，为每个智能体进行路径规划和观测修改。
++        
++        工作流程：
++        1. 更新路径规划器：基于当前观测更新动态代价（其他智能体位置）
++        2. 获取路径：为每个智能体计算到目标的最短路径
++        3. 子目标选择：从路径中选择下一个子目标（path[1]）
++        4. 内在奖励计算：如果智能体到达了上一帧的子目标，给予奖励
++        5. 观测修改：
++           - 障碍物值：从1变为-1（便于区分）
++           - 路径标记：将路径点标记为+1.0（在观测范围内）
++        
++        路径处理逻辑：
++        - 如果路径为None（无可行路径）：使用最终目标作为子目标
++        - 如果路径存在：使用path[1]作为子目标（path[0]是当前位置）
++        - 只标记在观测范围内的路径点
++        
++        参数:
++            observations: 原始观测列表，每个元素是智能体的观测字典
++        
++        返回:
++            修改后的观测列表，包含路径标记和障碍物标记
++        '''
++        # 更新代价惩罚（基于当前观测，独立为每个智能体更新）
+         self.re_plan.update(observations)
+ 
+-        # Retrieve the shortest path to the global target for each agent.
++        # 获取每个智能体到全局目标的最短路径
+         paths = self.re_plan.get_path()
+ 
+-        new_goals = []  # Initialize a list to store new goals for each agent.
+-        intrinsic_rewards = []  # Initialize a list to store intrinsic rewards for each agent.
++        new_goals = []  # 存储每个智能体的新子目标
++        intrinsic_rewards = []  # 存储每个智能体的内在奖励
+ 
+-        # Iterate through agents and their respective paths.
++        # 遍历智能体及其对应路径
+         for k, path in enumerate(paths):
+             obs = observations[k]
+ 
+-            # Check if there is no valid path available.
++            # 检查是否有有效路径
+             if path is None:
+-                new_goals.append(obs['target_xy'])  # Use the target position as a new goal.
++                new_goals.append(obs['target_xy'])  # 使用目标位置作为子目标
+                 path = []
+             else:
+-                # Check if the agent reached their subgoal from its previous step
++                # 检查智能体是否到达了上一帧的子目标
+                 subgoal_achieved = self.prev_goals and obs['xy'] == self.prev_goals[k]
+-                # Assign an intrinsic reward if conditions are met, otherwise set it to 0.
++                # 如果到达子目标，给予内在奖励，否则为0
+                 intrinsic_rewards.append(self._cfg.intrinsic_target_reward if subgoal_achieved else 0.0)
+-                # Select a new target point.
++                # 选择路径上的下一个点作为新的子目标
+                 new_goals.append(path[1])
+ 
+-            # Set obstacle values to -1.0 in the observation.
++            # 将观测中的障碍物值设置为-1.0（便于与路径区分）
+             obs['obstacles'][obs['obstacles'] > 0] *= -1
+ 
+-            # Adding path to the observation, setting path values to +1.0.
+-            r = obs['obstacles'].shape[0] // 2
++            # 将路径添加到观测中，路径点设置为+1.0
++            r = obs['obstacles'].shape[0] // 2  # 观测半径
+             for idx, (gx, gy) in enumerate(path):
+-                x, y = self.get_relative_xy(*obs['xy'], gx, gy, r)
+-                if x is not None and y is not None:
+-                    obs['obstacles'][x, y] = 1.0
++                x, y = self.get_relative_xy(*obs['xy'], gx, gy, r)  # 转换为局部坐标
++                if x is not None and y is not None:  # 如果路径点在观测范围内
++                    obs['obstacles'][x, y] = 1.0  # 标记为路径点
+                 else:
+-                    break
+-            # print(obs['obstacles'])
+-        # Update the previous goals and intrinsic rewards for the next step.
++                    break  # 超出观测范围，停止标记
++        # 更新上一帧的子目标和内在奖励，供下一帧使用
+         self.prev_goals = new_goals
+         self.intrinsic_reward = intrinsic_rewards
+ 
+         return observations
+ 
+     def get_intrinsic_rewards(self, reward):
++        '''
++        用内在奖励替换环境原始奖励。
++        
++        这是"Learn to Follow"算法的关键：通过内在奖励引导智能体学习跟随路径规划器。
++        环境奖励被完全替换为基于路径跟随的内在奖励。
++        
++        参数:
++            reward: 原始环境奖励列表
++        
++        返回:
++            替换后的奖励列表（内在奖励）
++        '''
+         for agent_idx, r in enumerate(reward):
+             reward[agent_idx] = self.intrinsic_reward[agent_idx]
+         return reward
+ 
+     def step(self, action):
++        '''
++        执行一步环境交互，应用观测处理和奖励替换。
++        
++        参数:
++            action: 智能体动作列表
++        
++        返回:
++            处理后的观测、内在奖励、完成标志、截断标志和信息
++        '''
+         observation, reward, done, tr, info = self.env.step(action)
+         return self.observation(observation), self.get_intrinsic_rewards(reward), done, tr, info
+ 
+     def reset_state(self):
+-        self.re_plan.reset_states()
++        '''
++        重置包装器状态，初始化路径规划器和历史记录。
++        
++        工作内容：
++        1. 重置路径规划器状态
++        2. 向规划器添加全局障碍物和智能体初始位置
++        3. 清空上一帧的子目标和奖励记录
++        '''
++        self.re_plan.reset_states()  # 重置规划器
++        # 添加全局障碍物和智能体初始位置到规划器
+         self.re_plan._agent.add_grid_obstacles(self.get_global_obstacles(), self.get_global_agents_xy())
+ 
+-        self.prev_goals = None
+-        self.intrinsic_reward = None
++        self.prev_goals = None  # 清空上一帧的子目标
++        self.intrinsic_reward = None  # 清空奖励记录
+ 
+     def reset(self, **kwargs):
++        '''
++        重置环境并初始化包装器状态。
++        
++        参数:
++            **kwargs: 重置参数
++        
++        返回:
++            处理后的观测和信息字典
++        '''
+         observations, infos = self.env.reset(**kwargs)
+-        self.reset_state()
+-        return self.observation(observations), infos
++        self.reset_state()  # 重置包装器状态
++        return self.observation(observations), infos  # 返回处理后的观测
+ 
+ 
+ class CutObservationWrapper(ObservationWrapper):
++    '''
++    观测裁剪包装器，将观测从原始大小裁剪到网络输入大小。
++    
++    作用：
++    - 环境可能提供较大的观测范围（如obs_radius=5，11x11）
++    - 神经网络只需要较小的输入（如network_input_radius=5，也是11x11，或更小）
++    - 从观测中心裁剪出指定大小的区域
++    
++    工作原理：
++    - 计算观测中心位置
++    - 从中心向四周裁剪target_observation_radius大小的区域
++    - 只裁剪形状为(d, d)的观测（如obstacles、agents等位置特征）
++    - 其他类型的观测保持不变
++    
++    使用场景：
++    - 当环境的观测半径大于网络输入半径时使用
++    - 减少网络输入大小，降低计算量和内存占用
++    - 保留以智能体为中心的关键信息
++    '''
+     def __init__(self, env, target_observation_radius):
++        '''
++        初始化裁剪包装器，更新观测空间定义。
++        
++        参数:
++            target_observation_radius: 目标观测半径（网络输入半径）
++        '''
+         super().__init__(env)
+-        self._target_obs_radius = target_observation_radius
+-        self._initial_obs_radius = self.env.observation_space['obstacles'].shape[0] // 2
++        self._target_obs_radius = target_observation_radius  # 目标观测半径
++        self._initial_obs_radius = self.env.observation_space['obstacles'].shape[0] // 2  # 原始观测半径
+ 
++        # 更新观测空间：将所有(d, d)形状的观测裁剪到目标大小
+         for key, value in self.observation_space.items():
+-            d = self._initial_obs_radius * 2 + 1
+-            if value.shape == (d, d):
++            d = self._initial_obs_radius * 2 + 1  # 原始观测大小
++            if value.shape == (d, d):  # 如果是位置特征（二维数组）
+                 r = self._target_obs_radius
+-                self.observation_space[key] = Box(0.0, 1.0, shape=(r * 2 + 1, r * 2 + 1))
++                self.observation_space[key] = Box(0.0, 1.0, shape=(r * 2 + 1, r * 2 + 1))  # 更新为裁剪后的大小
+ 
+     def observation(self, observations):
+-        tr = self._target_obs_radius
+-        ir = self._initial_obs_radius
+-        d = ir * 2 + 1
++        '''
++        裁剪观测到目标大小，从中心区域提取。
++        
++        裁剪公式：
++        - 中心位置：ir (初始观测半径)
++        - 裁剪范围：[ir - tr : ir + tr + 1]，即从中心向四周裁剪tr半径的区域
++        - 只裁剪形状为(d, d)的数组（位置特征）
++        
++        参数:
++            observations: 原始观测列表
++        
++        返回:
++            裁剪后的观测列表
++        '''
++        tr = self._target_obs_radius  # 目标半径
++        ir = self._initial_obs_radius  # 初始半径
++        d = ir * 2 + 1  # 初始观测大小
+ 
+         for obs in observations:
+             for key, value in obs.items():
+-                if hasattr(value, 'shape') and value.shape == (d, d):
++                if hasattr(value, 'shape') and value.shape == (d, d):  # 如果是位置特征
++                    # 从中心裁剪：中心位置为ir，裁剪范围[ir-tr, ir+tr+1]
+                     obs[key] = value[ir - tr:ir + tr + 1, ir - tr:ir + tr + 1]
+ 
+         return observations
+ 
+ 
+ class ConcatPositionalFeatures(ObservationWrapper):
++    '''
++    位置特征拼接包装器，将多个位置特征（如obstacles、agents）拼接为单一obs张量。
++    
++    作用：
++    - 将多个二维位置特征（obstacles, agents, agents_global等）拼接为一个三维张量
++    - 便于神经网络处理：输入格式为(channels, height, width)
++    - 保持非位置特征（如xy坐标）在观测字典中，不被拼接
++    
++    拼接顺序（通过key_comparator排序）：
++    1. obstacles（优先级0）：障碍物地图，最重要
++    2. agents相关（优先级1）：智能体位置信息
++    3. 其他位置特征（优先级2）：其他二维特征
++    
++    输出格式：
++    - obs: 形状为(n_features, height, width)的三维数组，包含所有位置特征
++    - 其他键值对（如xy, target_xy）保留在观测字典中，作为额外信息
++    '''
+ 
+     def __init__(self, env):
++        '''
++        初始化拼接包装器，识别需要拼接的位置特征并更新观测空间。
++        
++        工作流程：
++        1. 识别所有形状为(full_size, full_size)的特征（位置特征）
++        2. 将这些特征标记为需要拼接
++        3. 创建新的观测空间，包含拼接后的obs张量
++        4. 按照key_comparator排序，确保拼接顺序一致
++        '''
+         super().__init__(env)
+-        self.to_concat = []
++        self.to_concat = []  # 需要拼接的键列表
+ 
+         observation_space = Dict()
+-        full_size = self.env.observation_space['obstacles'].shape[0]
++        full_size = self.env.observation_space['obstacles'].shape[0]  # 观测大小
+ 
++        # 识别需要拼接的位置特征
+         for key, value in self.observation_space.items():
+-            if value.shape == (full_size, full_size):
++            if value.shape == (full_size, full_size):  # 如果是位置特征（二维数组）
+                 self.to_concat.append(key)
+             else:
+-                observation_space[key] = value
++                observation_space[key] = value  # 非位置特征保留在字典中
+ 
++        # 创建拼接后的obs张量：形状为(n_features, height, width)
+         obs_shape = (len(self.to_concat), full_size, full_size)
+         observation_space['obs'] = Box(0.0, 1.0, shape=obs_shape)
+-        self.to_concat.sort(key=self.key_comparator)
++        self.to_concat.sort(key=self.key_comparator)  # 按优先级排序
+         self.observation_space = observation_space
+ 
+     def observation(self, observations):
++        '''
++        拼接位置特征为obs张量，并清理原始特征。
++        
++        工作流程：
++        1. 对每个智能体的观测，按顺序拼接所有位置特征
++        2. 从原始观测字典中删除已拼接的特征
++        3. 将其他特征转换为float32类型
++        4. 将拼接后的obs张量添加到观测字典
++        
++        参数:
++            observations: 原始观测列表
++        
++        返回:
++            拼接后的观测列表，包含obs张量和其他特征
++        '''
+         for agent_idx, obs in enumerate(observations):
+-            main_obs = np.concatenate([obs[key][None] for key in self.to_concat])
++            # 按顺序拼接所有位置特征：[None]增加一个维度用于拼接
++            main_obs = np.concatenate([obs[key][None] for key in self.to_concat], axis=0)
++            # 删除已拼接的原始特征
+             for key in self.to_concat:
+                 del obs[key]
+ 
++            # 将剩余特征转换为float32
+             for key in obs:
+                 obs[key] = np.array(obs[key], dtype=np.float32)
++            # 添加拼接后的obs张量
+             observations[agent_idx]['obs'] = main_obs.astype(np.float32)
+         return observations
+ 
+     @staticmethod
+     def key_comparator(x):
++        '''
++        键比较器，用于确定位置特征的拼接顺序。
++        
++        排序规则：
++        - obstacles: 优先级0（最重要，第一个通道）
++        - 包含'agents'的键: 优先级1（智能体相关特征）
++        - 其他: 优先级2（其他位置特征）
++        
++        参数:
++            x: 特征键名
++        
++        返回:
++            排序键字符串，用于确定拼接顺序
++        '''
+         if x == 'obstacles':
+-            return '0_' + x
++            return '0_' + x  # obstacles优先级最高
+         elif 'agents' in x:
+-            return '1_' + x
+-        return '2_' + x
++            return '1_' + x  # agents相关次之
++        return '2_' + x  # 其他特征最后
+ 
+ 
+ class AutoResetWrapper(gymnasium.Wrapper):
++    '''
++    自动重置包装器，当所有智能体完成时自动重置环境。
++    
++    作用：
++    - 训练时自动处理回合结束，无需手动重置
++    - 确保训练循环的连续性
++    - 在回合结束时立即返回新回合的初始观测
++    
++    工作原理：
++    - 检测所有智能体是否完成（all(terminated) 或 all(truncated)）
++    - 如果完成，自动调用reset()获取新回合的初始观测
++    - 返回新的观测，但保持原来的奖励和完成标志
++    
++    注意事项：
++    - 只在训练时使用（wrap_preprocessors中auto_reset=True）
++    - 推理时通常不使用，需要手动控制重置时机
++    - 重置后返回的observations是新的，但rewards和flags仍是上一回合的
++    
++    使用场景：
++    - Sample Factory训练时自动重置，提高训练效率
++    - 批量环境训练时，自动处理各个环境的完成状态
++    '''
+     def step(self, action):
++        '''
++        执行一步环境交互，如果回合结束则自动重置。
++        
++        参数:
++            action: 智能体动作列表
++        
++        返回:
++            - observations: 如果回合结束则为新回合的初始观测，否则为当前观测
++            - rewards, terminated, truncated, infos: 当前步骤的返回值
++        '''
+         observations, rewards, terminated, truncated, infos = self.env.step(action)
++        # 如果所有智能体都完成（terminated或truncated），自动重置环境
+         if all(terminated) or all(truncated):
+-            observations, _ = self.env.reset()
++            observations, _ = self.env.reset()  # 获取新回合的初始观测
+         return observations, rewards, terminated, truncated, infos
+diff --git a/follower/register_env.py b/follower/register_env.py
+index 9a18ce0..f68f81e 100644
+--- a/follower/register_env.py
++++ b/follower/register_env.py
+@@ -11,12 +11,46 @@ from follower.preprocessing import PreprocessorConfig, wrap_preprocessors
+ 
+ 
+ def create_env(environment_cfg: Environment, preprocessing_cfg: PreprocessorConfig):
++    '''
++    创建单个环境实例，并应用预处理包装器。
++    
++    工作流程：
++    1. 使用environment_cfg创建基础环境（包含地图、智能体配置等）
++    2. 应用预处理包装器（添加观测预处理、奖励处理等）
++    3. 返回完整配置的环境实例
++    
++    参数:
++        environment_cfg: 环境配置对象，包含地图、智能体数量、观测半径等配置
++        preprocessing_cfg: 预处理配置对象，定义观测预处理方式
++    
++    返回:
++        配置好的环境实例，可以直接用于训练或推理
++    '''
+     env = create_env_base(environment_cfg)
+-    env = wrap_preprocessors(env, config=preprocessing_cfg, auto_reset=True)
++    env = wrap_preprocessors(env, config=preprocessing_cfg, auto_reset=True)  # 应用预处理包装器（添加观测预处理、奖励处理等）也就是论文的关键预处理策略（规划+观测拼接+裁剪）
+     return env
+ 
+ 
+ class MultiEnv(gymnasium.Wrapper):
++    '''
++    多环境包装器类，将多个环境实例组合成一个统一的环境接口。
++    
++    主要用途：
++    - 支持大规模智能体训练：当target_num_agents > grid_config.num_agents时，
++      通过创建多个子环境来实现大规模智能体训练（课程学习场景）
++    - 统一接口：将多个环境的行为（step、reset等）合并为单个环境的接口，
++      对上层代码透明
++    
++    工作原理：
++    - 如果target_num_agents为None，只创建单个环境
++    - 如果target_num_agents不为None，创建多个子环境，每个子环境的智能体数量
++      由grid_config.num_agents决定，子环境数量 = target_num_agents // num_agents
++    - step和reset操作会遍历所有子环境，合并它们的返回结果
++    
++    使用场景：
++    - 课程学习：不同env_id可以使用不同的agent_bins值，实现从少到多的智能体数量训练
++    - 大规模训练：通过多个子环境并行处理，支持更多智能体的训练
++    '''
+     def __init__(self, env_cfg: Environment, preprocessing_cfg: PreprocessorConfig):
+         if env_cfg.target_num_agents is None:
+             self.envs = [create_env(env_cfg, preprocessing_cfg)]
+@@ -29,6 +63,15 @@ class MultiEnv(gymnasium.Wrapper):
+         super().__init__(self.envs[0])
+ 
+     def step(self, actions):
++        '''
++        执行一步环境交互，遍历所有子环境并合并结果。
++        
++        参数:
++            actions: 所有智能体的动作列表，需要按照子环境的顺序和智能体数量分组
++        
++        返回:
++            合并后的观测、奖励、完成标志、截断标志和信息字典
++        '''
+         obs, rewards, dones, truncated, infos = [], [], [], [], []
+         last_agents = 0
+         for env in self.envs:
+@@ -44,6 +87,16 @@ class MultiEnv(gymnasium.Wrapper):
+         return obs, rewards, dones, truncated, infos
+ 
+     def reset(self, seed, **kwargs):
++        '''
++        重置所有子环境，使用不同的种子确保环境间的多样性。
++        
++        参数:
++            seed: 基础随机种子
++            **kwargs: 其他重置参数
++        
++        返回:
++            合并后的观测列表和空字典（符合gymnasium接口规范）
++        '''
+         obs = []
+         for idx, env in enumerate(self.envs):
+             inner_seed = seed + idx
+@@ -52,6 +105,12 @@ class MultiEnv(gymnasium.Wrapper):
+         return obs, {}
+ 
+     def sample_actions(self):
++        '''
++        从所有子环境中采样动作，用于随机动作测试。
++        
++        返回:
++            所有智能体的随机动作数组
++        '''
+         actions = []
+         for env in self.envs:
+             actions += list(env.sample_actions())
+@@ -59,39 +118,118 @@ class MultiEnv(gymnasium.Wrapper):
+ 
+     @property
+     def num_agents(self):
++        '''
++        获取所有子环境中的智能体总数。
++        
++        返回:
++            所有子环境的智能体数量之和
++        '''
+         return sum([env.get_num_agents() for env in self.envs])
+ 
+     def render(self):
++        '''
++        渲染所有子环境，用于可视化调试。
++        '''
+         for q in self.envs:
+             q.render()
+ 
+ 
+ def make_env(full_env_name, cfg=None, env_config=None, render_mode=None):
++    '''
++    Sample Factory框架需要的环境工厂函数，根据配置创建环境实例。
++    
++    工作流程：
++    1. 从cfg中解析Experiment配置对象
++    2. 提取environment和preprocessing配置
++    3. 如果配置了agent_bins和target_num_agents，启用课程学习模式：
++       - 根据env_id从agent_bins中选择智能体数量（循环选择）
++       - 创建MultiEnv包装器支持多环境组合
++    4. 否则创建单个环境实例
++    
++    课程学习机制：
++    - agent_bins定义了不同env_id对应的智能体数量列表
++    - env_id % len(agent_bins) 确保env_id循环选择agent_bins中的值
++    - 例如：agent_bins=[64, 128, 256], env_id=5 → 选择agent_bins[5%3=2]=256
++    
++    参数:
++        full_env_name: 环境名称（Sample Factory框架传入）
++        cfg: Sample Factory配置对象，包含所有训练参数
++        env_config: 环境特定配置（worker_index, vector_index, env_id等）
++        render_mode: 渲染模式（未使用）
++    
++    返回:
++        - MultiEnv实例：当启用课程学习时（agent_bins和target_num_agents均不为None）
++        - 单个环境实例：其他情况
++    '''
+     p_config = Experiment(**vars(cfg))
+     environment_config = p_config.environment
+     preprocessing_config = p_config.preprocessing
+     # todo make this code simpler
+ 
+     if environment_config.agent_bins is not None and environment_config.target_num_agents is not None:
++        # 课程学习模式：根据env_id从agent_bins中选择智能体数量
+         if environment_config.env_id is None:
+             num_agents = environment_config.agent_bins[0]
+         else:
+             num_agents = environment_config.agent_bins[environment_config.env_id % len(environment_config.agent_bins)]
+         environment_config.grid_config.num_agents = num_agents
+-
++        # 用MultiEnv把多个小环境拼成一个“大 batch”并行（把 actions/obs/reward 拼接起来）
+         return MultiEnv(environment_config, preprocessing_config)
++    # 创建单一的训练环境
+     return create_env(environment_config, preprocessing_config)
+ 
+ 
+ class CustomEnv:
++    '''
++    Sample Factory框架需要的环境工厂类。
++    
++    作用：
++    - 作为Sample Factory框架和环境创建函数之间的适配器
++    - Sample Factory的register_env函数需要一个包含make_env方法的对象
++    - 这个类封装了make_env函数，使其符合Sample Factory的接口要求
++    
++    使用方式：
++    - Sample Factory框架会调用CustomEnv().make_env()来创建环境实例
++    - 每个worker进程和vector环境都会调用此方法创建自己的环境实例
++    '''
+     def make_env(self, env_name, cfg, env_config, render_mode) -> Env:
++        '''
++        Sample Factory框架调用的环境创建方法。
++        
++        参数:
++            env_name: 环境名称
++            cfg: Sample Factory配置对象
++            env_config: 环境配置（包含worker_index, vector_index, env_id等）
++            render_mode: 渲染模式
++        
++        返回:
++            创建的环境实例
++        '''
+         return make_env(env_name, cfg, env_config, render_mode)
+ 
+ 
+ def register_pogema_envs(env_name):
++    '''
++    注册Pogema环境到Sample Factory框架。
++    
++    工作内容：
++    1. 创建CustomEnv工厂对象
++    2. 调用Sample Factory的register_env函数，将环境名称和工厂方法注册到框架中
++    3. 注册后，Sample Factory可以通过env_name找到对应的环境创建函数
++    
++    参数:
++        env_name: 环境名称标识符（如'PogemaMazes-v0'）
++    
++    使用场景：
++    - 在训练开始时调用，让Sample Factory框架知道如何创建指定的环境
++    - 必须在创建runner之前调用，否则框架无法找到环境创建函数
++    '''
+     env_factory = CustomEnv()
+     register_env(env_name, env_factory.make_env)
+ 
+ 
+ def register_custom_components(env_name):
++    '''
++    注册自定义环境组件到Sample Factory框架（统一入口函数）。
++    '''
+     register_pogema_envs(env_name)
+diff --git a/follower/register_training_utils.py b/follower/register_training_utils.py
+index bd90cde..aeb7b9a 100644
+--- a/follower/register_training_utils.py
++++ b/follower/register_training_utils.py
+@@ -1,4 +1,4 @@
+-from follower.model import ResnetEncoder
++from follower.model import ResnetEncoder, CNNTransformerEncoder
+ 
+ from sample_factory.algo.utils.context import global_model_factory
+ from sample_factory.utils.typing import ObsSpace
+@@ -39,6 +39,10 @@ def register_msg_handlers(cfg: Config, runner: Runner):
+ 
+ def make_custom_encoder(cfg: Config, obs_space: ObsSpace) -> Encoder:
+     """Factory function as required by the API."""
++    enc_cfg = getattr(cfg, 'encoder', {})
++    arch = enc_cfg.get('encoder_arch', 'resnet') if isinstance(enc_cfg, dict) else 'resnet'
++    if arch == 'cnn_transformer':
++        return CNNTransformerEncoder(cfg, obs_space)
+     return ResnetEncoder(cfg, obs_space)
+ 
+ 
+diff --git a/follower/training_config.py b/follower/training_config.py
+index 16665d0..af4562c 100644
+--- a/follower/training_config.py
++++ b/follower/training_config.py
+@@ -9,90 +9,133 @@ except ImportError:
+     from typing_extensions import Literal
+ 
+ from pogema import GridConfig
+-from pydantic import BaseModel
++from pydantic import BaseModel # 数据验证工具，定义的数据类型基于BaseModel之后可以使用注解定义字段。
+ 
+ 
+ class DecMAPFConfig(GridConfig):
+-    integration: Literal['SampleFactory'] = 'SampleFactory'
+-    collision_system: Literal['priority', 'block_both', 'soft'] = 'soft'
+-    observation_type: Literal['POMAPF'] = 'POMAPF'
+-    auto_reset: Literal[False] = False
++    '''
++    继承于pogema的网格地图配置信息
++    '''
++    integration: Literal['SampleFactory'] = 'SampleFactory' # 指定训练使用Sample Factory框架
++    collision_system: Literal['priority', 'block_both', 'soft'] = 'soft' # 碰撞处理的策略：优先级高有限，block_both同时阻止，soft软碰撞。
++    observation_type: Literal['POMAPF'] = 'POMAPF' # 观测类型：POMAPF，就是局部观测，只能观测局部范围的信息。
++    auto_reset: Literal[False] = False # 是否自动重置环境。
+ 
+-    num_agents: int = 64
+-    obs_radius: int = 5
+-    max_episode_steps: int = 512
+-    map_name: str = '(wc3-[A-P]|sc1-[A-S]|sc1-TaleofTwoCities|street-[A-P]|mazes-s[0-9]_|mazes-s[1-3][0-9]_|random-s[0-9]_|random-s[1-3][0-9]_)'
++    num_agents: int = 64 # 环境中的智能体数量。
++    obs_radius: int = 5 # 观测半径，智能体可以观测到的范围。
++    max_episode_steps: int = 512 # 每个episode的最大步数， 也就是智能体在环境中可以移动的最大步数。
++    map_name: str = '(wc3-[A-P]|sc1-[A-S]|sc1-TaleofTwoCities|street-[A-P]|mazes-s[0-9]_|mazes-s[1-3][0-9]_|random-s[0-9]_|random-s[1-3][0-9]_)' # 地图名称的正则表达式，用于匹配地图名称。
+ 
+ 
+ class Environment(BaseModel, ):
+-    grid_config: DecMAPFConfig = DecMAPFConfig()
+-    env: Literal['PogemaMazes-v0'] = "PogemaMazes-v0"
+-    with_animation: bool = False
+-    worker_index: int = None
+-    vector_index: int = None
+-    env_id: int = None
+-    target_num_agents: Optional[int] = None
+-    agent_bins: Optional[list] = [64, 128, 256, 256]
+-    use_maps: bool = True
++    '''基础环境的配置'''
+ 
+-    every_step_metrics: bool = False
++    grid_config: DecMAPFConfig = DecMAPFConfig() # 地图环境，使用pogema的网格地图配置
++    env: Literal['PogemaMazes-v0'] = "PogemaMazes-v0" # 注册具体选用的环境
++    with_animation: bool = False # 是否开启动画显示。
++    worker_index: int = None # Sample Factory 多进程训练，工作进程索引
++    vector_index: int = None # 在向量化环境中标识环境实例
++    env_id: int = None # 环境实例ID
++    target_num_agents: Optional[int] = None # 目标智能体数量
++    agent_bins: Optional[list] = [64, 128, 256, 256] # 智能体数量列表
++    use_maps: bool = True # 是否使用预定义地图。 true 下 启用 MultiMapWrapper，从 MAPS_REGISTRY 中根据 map_name 模式匹配加载地图
++
++    every_step_metrics: bool = False # 是否每个步骤都记录指标。 False 仅在回合结束时记录
+ 
+ 
+ class EnvironmentMazes(Environment):
++    # 针对迷宫场景的特殊调配，只使用迷宫地图，使用更大的 agent_bins 起始值
+     env: Literal['PogemaMazes-v0'] = "PogemaMazes-v0"
+     use_maps: bool = True
+     target_num_agents: Optional[int] = 256
+     agent_bins: Optional[list] = [128, 256, 256, 256]
+     grid_config: DecMAPFConfig = DecMAPFConfig(on_target='restart', max_episode_steps=512,
+-                                               map_name=r'mazes-.+')
++                                               map_name=r'mazes-.+') # 覆盖网格配置，修改为终身问题，原始GridConfig是使用的Mapf，on_target是finish
+ 
+ 
+ class Experiment(BaseModel):
+-    environment: EnvironmentMazes = EnvironmentMazes()
+-    encoder: EncoderConfig = EncoderConfig()
+-    preprocessing: PreprocessorConfig = PreprocessorConfig()
+-
+-    rollout: int = 8
+-    num_workers: int = 4
+-
+-    recurrence: int = 8
+-    use_rnn: bool = False
+-    rnn_size: int = 256
+-
+-    ppo_clip_ratio: float = 0.1
+-    batch_size: int = 2048
+-
+-    exploration_loss_coeff: float = 0.018
+-    num_envs_per_worker: int = 4
+-    worker_num_splits: int = 1
+-    max_policy_lag: int = 1
+-
+-    force_envs_single_thread: bool = True
+-    optimizer: Literal["adam", "lamb"] = 'adam'
+-    restart_behavior: str = "overwrite"  # ["resume", "restart", "overwrite"]
+-    normalize_returns: bool = False
+-    async_rl: bool = False
+-    num_batches_per_epoch: int = 16
+-
+-    num_batches_to_accumulate: int = 1
+-    normalize_input: bool = False
+-    decoder_mlp_layers = []
+-    save_best_metric: str = "avg_throughput"
+-    value_bootstrap: bool = True
+-    save_milestones_sec: int = -1
+-
+-    keep_checkpoints: int = 1
+-    stats_avg: int = 10
+-    learning_rate: float = 0.000146
+-    train_for_env_steps: int = 1_000_000
+-
+-    gamma: float = 0.965
+-
+-    lr_schedule: str = 'kl_adaptive_minibatch'
+-
+-    experiment: str = 'exp'
+-    train_dir: str = 'experiments/train_dir'
+-    seed: Optional[int] = 42
+-    use_wandb: bool = True
+-
+-    env: Literal['PogemaMazes-v0'] = "PogemaMazes-v0"
++    '''
++    实验配置类，包含实验的各个配置项。
++    
++    重点配置参数说明：
++    
++    【并行与采样配置】
++    - rollout (默认8): 每个环境实例在收集数据前执行的最大步数，控制经验回放缓冲区大小
++    - num_workers (默认4): 并行采样进程数，实际训练常用8，更多workers提高采样速度
++    - num_envs_per_worker (默认4): 每个worker并行运行的环境实例数，总并行环境数 = num_workers × num_envs_per_worker
++    
++    【模型架构配置】
++    - use_rnn (默认False): 是否使用RNN，False使用MLP无记忆能力，True使用RNN/GRU处理时序依赖
++    - rnn_size (默认256): RNN隐藏层维度，仅在use_rnn=True时有效
++    - recurrence (默认8): RNN展开长度（训练时的序列长度），影响梯度传播距离和内存占用
++    
++    【训练超参数】
++    - learning_rate (默认0.000146): 学习率，实际训练中Follower约0.00022，FollowerLite约0.00013
++    - gamma (默认0.965): 折扣因子，范围[0,1]越大越重视长期奖励，实际训练中约0.97-0.98
++    - batch_size (默认2048): 每次梯度更新的样本数量，实际训练常用16384
++    - ppo_clip_ratio (默认0.1): PPO裁剪比例，限制策略更新幅度，实际训练常用0.2
++    - exploration_loss_coeff (默认0.018): 探索损失系数，鼓励策略探索，实际训练约0.015-0.023
++    - num_batches_per_epoch (默认16): 每个训练epoch的批次数量
++    
++    【优化器配置】
++    - optimizer (默认'adam'): 优化器类型，'adam'为Adam优化器，'lamb'为LAMB优化器适合大batch训练
++    - lr_schedule (默认'kl_adaptive_minibatch'): 学习率调度策略，kl_adaptive_minibatch根据KL散度自适应调整
++    
++    【训练目标】
++    - train_for_env_steps (默认1_000_000): 训练的总环境步数，实际训练中Follower约1e9，FollowerLite约2e7
++    - save_best_metric (默认"avg_throughput"): 保存最佳模型的评估指标，训练中持续监控该指标
++    
++    【环境配置】
++    - environment: 环境配置对象，包含地图、智能体、观测等环境相关参数
++    - encoder: 编码器配置对象，定义神经网络编码器的架构
++    - preprocessing: 预处理配置对象，定义观测预处理方式
++    '''
++    
++    environment: EnvironmentMazes = EnvironmentMazes()  # 环境配置对象，包含地图、智能体、观测等环境相关参数
++    encoder: EncoderConfig = EncoderConfig()  # 编码器配置对象，定义神经网络编码器的架构（ResNet层数、滤波器数量等）
++    preprocessing: PreprocessorConfig = PreprocessorConfig()  # 预处理配置对象，定义观测预处理方式（动态/静态代价、网络输入半径等）
++
++    rollout: int = 8  # 每个环境实例在收集数据前执行的最大步数，控制经验回放缓冲区大小，影响策略更新频率
++    num_workers: int = 4  # 并行采样进程数，每个worker独立运行环境并收集数据，更多workers提高采样速度但增加资源消耗
++
++    recurrence: int = 8  # RNN展开长度（训练时的序列长度），仅在use_rnn=True时有效，影响梯度传播距离和内存占用
++    use_rnn: bool = False  # 是否使用RNN（循环神经网络），False使用MLP无记忆能力，True使用RNN/GRU处理时序依赖
++    rnn_size: int = 256  # RNN隐藏层维度，仅在use_rnn=True时有效，更大维度增强表达能力但增加计算和内存
++
++    ppo_clip_ratio: float = 0.1  # PPO裁剪比例（ε），限制策略更新幅度避免更新过大，裁剪范围[1-ε, 1+ε]，常用0.2
++    batch_size: int = 2048  # 每次梯度更新的样本数量，从回放缓冲区采样batch_size个样本进行更新，常用16384
++
++    exploration_loss_coeff: float = 0.018  # 探索损失（熵奖励）系数，鼓励策略探索避免过早收敛，值越大探索越强
++    num_envs_per_worker: int = 4  # 每个worker并行运行的环境实例数，总并行环境数=num_workers×num_envs_per_worker
++    worker_num_splits: int = 1  # worker进程是否拆分用于负载均衡，1表示不拆分，>1时将worker工作拆分到多个子进程
++    max_policy_lag: int = 1  # 最大策略版本滞后数，采样worker使用的策略版本与当前策略版本的最大允许差距，1表示几乎同步
++
++    force_envs_single_thread: bool = True  # 强制环境使用单线程，避免多线程环境与Sample Factory多进程冲突，提高稳定性
++    optimizer: Literal["adam", "lamb"] = 'adam'  # 优化器类型，adam为Adam优化器，lamb为LAMB优化器适合大batch训练
++    restart_behavior: str = "overwrite"  # 重启行为：["resume", "restart", "overwrite"]，overwrite表示覆盖之前的实验结果
++    normalize_returns: bool = False  # 是否归一化回报（return），归一化可稳定训练但可能影响策略梯度估计
++    async_rl: bool = False  # 是否使用异步强化学习，False为同步训练（标准PPO），True为异步训练（如IMPALA）
++    num_batches_per_epoch: int = 16  # 每个训练epoch的批次数量，每个epoch使用num_batches_per_epoch×batch_size个样本
++
++    num_batches_to_accumulate: int = 1  # 梯度累积的批次数，在更新前累积多个批次的梯度，用于模拟更大的batch size
++    normalize_input: bool = False  # 是否归一化输入观测，归一化可提高训练稳定性但可能改变数据的原始分布
++    decoder_mlp_layers = []  # 解码器MLP的隐藏层大小列表，空列表表示无额外的解码器层（使用默认架构）
++    save_best_metric: str = "avg_throughput"  # 保存最佳模型的评估指标，训练中持续监控该指标保存最佳模型
++    value_bootstrap: bool = True  # 是否使用价值函数引导，用价值函数估计未结束轨迹的未来奖励，提高回报估计准确性
++    save_milestones_sec: int = -1  # 按时间间隔保存里程碑检查点（秒），-1表示禁用，>0时按时间间隔保存
++
++    keep_checkpoints: int = 1  # 保留的检查点数量，仅保留最新的1个检查点，删除旧检查点以节省空间
++    stats_avg: int = 10  # 统计指标的平滑窗口大小，使用最近10个回合的平均值进行统计，平滑波动
++    learning_rate: float = 0.000146  # 学习率，控制参数更新步长，实际训练中Follower约0.00022，FollowerLite约0.00013
++    train_for_env_steps: int = 1_000_000  # 训练的总环境步数，训练会持续直到累计环境交互步数达到该值
++
++    gamma: float = 0.965  # 折扣因子（未来奖励的折扣），范围[0,1]越大越重视长期奖励，0.965表示未来第k步权重为0.965^k
++
++    lr_schedule: str = 'kl_adaptive_minibatch'  # 学习率调度策略，kl_adaptive_minibatch根据KL散度自适应调整，constant为固定学习率
++
++    experiment: str = 'exp'  # 实验名称标识符，用于区分不同的实验，会出现在保存路径和日志中
++    train_dir: str = 'experiments/train_dir'  # 训练结果保存目录，包含检查点、日志、配置文件等
++    seed: Optional[int] = 42  # 随机种子，用于确保实验可复现，相同种子会产生相同的随机数序列
++    use_wandb: bool = True  # 是否使用wandb（Weights & Biases）进行实验跟踪和可视化，True时记录训练指标
++
++    env: Literal['PogemaMazes-v0'] = "PogemaMazes-v0"  # 环境名称标识符，与Sample Factory框架中注册的环境名称对应
+diff --git a/follower/training_utils.py b/follower/training_utils.py
+index 1190c45..d7f6e96 100644
+--- a/follower/training_utils.py
++++ b/follower/training_utils.py
+@@ -26,7 +26,7 @@ def create_sf_config(exp: Experiment):
+ 
+ 
+ def run(config=None):
+-    register_custom_model()
++    register_custom_model() # 注册自定义的encoder模型 
+ 
+     if config is None:
+         import argparse
+@@ -59,7 +59,7 @@ def run(config=None):
+     flat_config = Namespace(**exp.dict())
+     env_name = exp.environment.env
+     log.debug(f'env_name = {env_name}')
+-    register_custom_components(env_name)
++    register_custom_components(env_name) # 注册自定义环境创建函数给SampleFactory
+ 
+     log.info(flat_config)
+ 
+@@ -70,13 +70,14 @@ def run(config=None):
+         import os
+         if params.wandb_thread_mode:
+             os.environ["WANDB_START_METHOD"] = "thread"
+-        wandb.init(project='Learn-to-Follow', config=exp.dict(), save_code=False, sync_tensorboard=True,
++        # 绑定wandb对应的训练可视化库
++        wandb.init(project='follow-lite', config=exp.dict(), save_code=False, sync_tensorboard=True,
+                    anonymous="allow", job_type=exp.environment.env, group='train')
+ 
+-    flat_config, runner = make_runner(create_sf_config(exp))
+-    register_msg_handlers(flat_config, runner)
+-    status = runner.init()
++    flat_config, runner = make_runner(create_sf_config(exp)) # 将模型交给SampleFactory跑PPO，实际上就是将实验设置好的配置参数exp传递给SampleFactory函数接口
++    register_msg_handlers(flat_config, runner) # 注册消息处理函数
++    status = runner.init() # 训练初始化
+     if status == ExperimentStatus.SUCCESS:
+-        status = runner.run()
++        status = runner.run() # 训练开始
+ 
+     return status
+diff --git a/main.py b/main.py
+index 8b59863..6bb3317 100644
+--- a/main.py
++++ b/main.py
+@@ -3,6 +3,10 @@ from sys import argv
+ from follower.training_config import Experiment
+ from follower.training_utils import run, create_sf_config
+ 
++from ccp.training_config import Experiment as ExperimentCCP
++from ccp.training_utils import run as run_ccp
++from ccp.training_utils import create_sf_config as create_sf_config_ccp
++
+ 
+ def recursive_update(experiment: dict, key, value):
+     if key in experiment:
+@@ -39,7 +43,7 @@ def parse_args_to_items(argv_):
+ 
+ 
+ def main():
+-    experiment = Experiment()
++    experiment = Experiment() # 创建实验
+     experiment = create_sf_config(experiment).__dict__
+     keys, values = parse_args_to_items(list(argv))
+ 
+@@ -47,6 +51,16 @@ def main():
+     update_dict(experiment, keys, values)
+     run(config=experiment)
+ 
++def main_ccp():
++    experiment = ExperimentCCP() # 创建实验
++    experiment = create_sf_config(experiment).__dict__
++    keys, values = parse_args_to_items(list(argv))
++
++    # check all args and replace them in experiment recursively
++    update_dict(experiment, keys, values)
++    run_ccp(config=experiment)
++
+ 
+ if __name__ == '__main__':
++    # main()
+     main()
+\ No newline at end of file
+diff --git a/model/follower/config.json b/model/follower/config.json
+index 11e7431..6c2f370 100644
+--- a/model/follower/config.json
++++ b/model/follower/config.json
+@@ -1,4 +1,5 @@
+ {
++  "policy_index": 2,
+   "help": false,
+   "algo": "APPO",
+   "env": "PogemaMazes-v0",
