@@ -5,7 +5,7 @@ from pogema import AnimationConfig, AnimationMonitor
 
 from pogema import pogema_v0
 
-from follower.training_config import Environment
+from ccp.training_config import Environment
 
 import gymnasium
 import re
@@ -13,7 +13,7 @@ from copy import deepcopy
 from pogema import GridConfig
 
 from env.custom_maps import MAPS_REGISTRY
-from follower.preprocessing import wrap_preprocessors, PreprocessorConfig
+from ccp.preprocessing import wrap_preprocessors, PreprocessorConfig
 
 
 class ProvideGlobalObstacles(gymnasium.Wrapper):
@@ -50,6 +50,24 @@ class ProvideGlobalObstacles(gymnasium.Wrapper):
             智能体坐标列表，每个元素是(x, y)坐标元组
         '''
         return self.grid.get_agents_xy()
+    
+    def get_positions(self):
+        '''
+        获取全局地图中agent的位置。
+        '''
+        return self.grid.positions_xy
+
+    def get_taget(self):
+        '''
+        获取全局地图中target的位置。
+        '''
+        return self.grid.finishes_xy
+
+    def get_global_map(self):
+        '''
+        获取全局原始地图
+        '''
+        return self.grid.config.map
 
 
 def create_env_base(config: Environment):

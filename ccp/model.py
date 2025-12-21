@@ -2,6 +2,7 @@ from argparse import Namespace
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 from pydantic import BaseModel
 from sample_factory.model.encoder import Encoder
 from sample_factory.utils.typing import Config, ObsSpace
@@ -39,7 +40,7 @@ class EncoderConfig(BaseModel):
     - Follower: num_filters=64, num_res_blocks=8, extra_fc_layers=1, hidden_size=512
     - FollowerLite: num_filters=8, num_res_blocks=1, extra_fc_layers=0
     '''
-    encoder_arch: Literal['resnet', 'cnn_transformer', 'st_gat_former'] = 'resnet'
+    encoder_arch: Literal['resnet', 'cnn_transformer', 'st_gat_former'] = 'st_gat_former'
     extra_fc_layers: int = 0  # 额外全连接层数量，默认0（不使用）
     num_filters: int = 64  # 卷积层滤波器数量，决定特征图通道数
     num_res_blocks: int = 1  # ResNet残差块数量，决定网络深度
@@ -50,7 +51,11 @@ class EncoderConfig(BaseModel):
     transformer_nhead: int = 4
     transformer_dim_feedforward: int = 256
     transformer_dropout: float = 0.0
-    transformer_use_cls_token: bool = False
+    transformer_use_cls_token: bool = True
+
+    has_global_map: bool = True
+    cache_map_side: int = 51
+
 
 
 def activation_func(cfg: EncoderConfig) -> nn.Module:
@@ -278,7 +283,7 @@ class CNNTransformerEncoder(Encoder):
         h, w = obs_space['obs'].shape[1], obs_space['obs'].shape[2]
         self.num_tokens = int(h * w)
 
-        d_model = int(self.encoder_cfg.num_filters)
+        d_model = int(self.encoder_cfg.num_filters) # 就是通道数
         nhead = int(self.encoder_cfg.transformer_nhead)
         if d_model % nhead != 0:
             log.warning(
@@ -295,11 +300,13 @@ class CNNTransformerEncoder(Encoder):
             activation_func(self.encoder_cfg),
         )
 
+        ## pos_embed 位置编码
         seq_len = self.num_tokens + (1 if self.encoder_cfg.transformer_use_cls_token else 0)
         self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, d_model))
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
 
         if self.encoder_cfg.transformer_use_cls_token:
+            # 是否开启了可以学习的patch向量，更偏“分类/决策/全局输出”的任务：CLS 常常有优势（全局汇聚更灵活）。
             self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
             nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
         else:
@@ -314,10 +321,15 @@ class CNNTransformerEncoder(Encoder):
             batch_first=True,
             norm_first=True,
         )
+
+        # 该模型的 Transformer 是一个 2 层、4 头、d_model=64、FFN=256、GELU、Pre-LN、无 dropout 的 Encoder-only 结构，
+        # 输入为 11×11 网格展平得到的 121 个 token + 1 个可学习 CLS token（共 122 token），
+        # 加上 可学习位置编码，最后用 CLS 输出作为全局特征，再经过 64->512 的 MLP 投影得到 encoder 输出
         self.transformer = nn.TransformerEncoder(layer, num_layers=int(self.encoder_cfg.transformer_num_layers))
 
         self.encoder_out_size = d_model
         if self.encoder_cfg.extra_fc_layers:
+            # 如果配置了额外全连接层，进行特征投影
             self.extra_linear = nn.Sequential(
                 nn.Linear(self.encoder_out_size, self.encoder_cfg.hidden_size),
                 activation_func(self.encoder_cfg),
@@ -330,37 +342,45 @@ class CNNTransformerEncoder(Encoder):
         return self.encoder_out_size
 
     def forward(self, x):
-        x = x['obs']
-        x = self.cnn(x)
+        x = x['obs'] # (16, 2, 11, 11)
+        x = self.cnn(x) # (16, 64, 11, 11), 两层3*3卷积+Relu激活
 
-        x = x.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2) # （16, 121, 64), transport的目的就是把CNN的网格转换成Transformer适用的序列embeddings
         if self.cls_token is not None:
-            cls = self.cls_token.expand(x.shape[0], -1, -1)
-            x = torch.cat([cls, x], dim=1)
+            cls = self.cls_token.expand(x.shape[0], -1, -1) # cls 从(1, 1, 64) -> (16, 1, 64)
+            x = torch.cat([cls, x], dim=1) #（16, 121, 64) -> (16, 122, 64)
 
-        x = x + self.pos_embed
-        x = self.transformer(x)
+        x = x + self.pos_embed # 添加pos_embed 位置编码
+        x = self.transformer(x) # （16, 122, 64)，送入Transformer
 
         if self.cls_token is not None:
-            x = x[:, 0]
+            x = x[:, 0] # 取出CLS token作为输出
         else:
-            x = x.mean(dim=1)
+            x = x.mean(dim=1) # 取出平均值作为输出
 
         if self.encoder_cfg.extra_fc_layers:
-            x = self.extra_linear(x)
+            x = self.extra_linear(x) # （16, 64) -> (16, 512)
 
-        return x
+        return x                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
 
 
 class STGATFormerEncoder(Encoder):
     def __init__(self, cfg: Config, obs_space: ObsSpace):
         super().__init__(cfg)
-        self.encoder_cfg: EncoderConfig = EncoderConfig(**cfg.encoder) # 读入编码器的相关配置
+        self.encoder_cfg: EncoderConfig = EncoderConfig(**cfg.encoder)
 
-        input_ch = obs_space['obs'].shape[0] # 获取输入的通道数
+        input_ch = obs_space['obs'].shape[0]
+        h, w = obs_space['obs'].shape[1], obs_space['obs'].shape[2]
+        self.num_tokens = int(h * w)
 
-        d_model = int(self.encoder_cfg.num_filters) # 获取模型的维度
-        nhead = int(self.encoder_cfg.transformer_nhead) # 获取注意力头数
+        self._has_global_map = self.encoder_cfg.has_global_map
+
+        self.global_num_tokens = 0
+        self.cache_map_side = self.encoder_cfg.cache_map_side
+        self.global_map_token_sink = (int(h), int(w))
+
+        d_model = int(self.encoder_cfg.num_filters) # 就是通道数
+        nhead = int(self.encoder_cfg.transformer_nhead)
         if d_model % nhead != 0:
             log.warning(
                 'transformer_nhead (%d) does not divide d_model (%d), using nhead=1',
@@ -369,47 +389,41 @@ class STGATFormerEncoder(Encoder):
             )
             nhead = 1
 
-        self.grid_encoder = nn.Sequential(
+        self.cnn = nn.Sequential(
             nn.Conv2d(input_ch, d_model, kernel_size=3, stride=1, padding=1),
             activation_func(self.encoder_cfg),
             nn.Conv2d(d_model, d_model, kernel_size=3, stride=1, padding=1),
             activation_func(self.encoder_cfg),
         )
 
-        self.grid_pool = nn.AdaptiveAvgPool2d((1, 1))
+        if self._has_global_map:
+            gm_shape = obs_space['global_map'].shape
+            if len(gm_shape) == 2:
+                gm_ch = 1
+            else:
+                gm_ch = int(gm_shape[0])
 
-        self.goal_mlp = nn.Sequential(
-            nn.Linear(2, d_model),
-            activation_func(self.encoder_cfg),
-            nn.Linear(d_model, d_model),
-        )
+            self.global_num_tokens = int(self.global_map_token_sink[0] * self.global_map_token_sink[1])
+            self.global_cnn = nn.Sequential(
+                nn.Conv2d(gm_ch, d_model, kernel_size=3, stride=2, padding=1),
+                activation_func(self.encoder_cfg),
+                nn.Conv2d(d_model, d_model, kernel_size=3, stride=2, padding=1),
+                activation_func(self.encoder_cfg),
+                nn.Conv2d(d_model, d_model, kernel_size=3, stride=1, padding=0),
+                activation_func(self.encoder_cfg),
+            )
 
-        self.heur_encoder = nn.Sequential(
-            nn.Conv2d(1, d_model, kernel_size=3, stride=1, padding=1),
-            activation_func(self.encoder_cfg),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
+        ## pos_embed 位置编码
+        seq_len = self.num_tokens + self.global_num_tokens + (1 if self.encoder_cfg.transformer_use_cls_token else 0)
+        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, d_model))
+        nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
 
-        self.neighbor_mlp = nn.Sequential(
-            nn.Linear(2, d_model),
-            activation_func(self.encoder_cfg),
-            nn.Linear(d_model, d_model),
-        )
-
-        max_neighbors = int(obs_space['agents_xy'].shape[0]) if 'agents_xy' in obs_space else 0
-        self._max_neighbors = max_neighbors
-        l = 1 + max_neighbors
-        if l > 0:
-            attn_mask = torch.ones((l, l), dtype=torch.bool)
-            attn_mask[0, :] = False
-            attn_mask[:, 0] = False
-            attn_mask.fill_diagonal_(False)
+        if self.encoder_cfg.transformer_use_cls_token:
+            # 是否开启了可以学习的patch向量，更偏“分类/决策/全局输出”的任务：CLS 常常有优势（全局汇聚更灵活）。
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+            nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
         else:
-            attn_mask = torch.zeros((1, 1), dtype=torch.bool)
-        self.register_buffer('_star_attn_mask', attn_mask, persistent=False)
-
-        self.gat_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=True)
-        self.gat_norm = nn.LayerNorm(d_model)
+            self.cls_token = None
 
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -420,86 +434,59 @@ class STGATFormerEncoder(Encoder):
             batch_first=True,
             norm_first=True,
         )
-        self.temporal_transformer = nn.TransformerEncoder(layer, num_layers=int(self.encoder_cfg.transformer_num_layers))
+
+        # 该模型的 Transformer 是一个 2 层、4 头、d_model=64、FFN=256、GELU、Pre-LN、无 dropout 的 Encoder-only 结构，
+        # 输入为 11×11 网格展平得到的 121 个 token + 1 个可学习 CLS token（共 122 token），
+        # 加上 可学习位置编码，最后用 CLS 输出作为全局特征，再经过 64->512 的 MLP 投影得到 encoder 输出
+        self.transformer = nn.TransformerEncoder(layer, num_layers=int(self.encoder_cfg.transformer_num_layers))
 
         self.encoder_out_size = d_model
         if self.encoder_cfg.extra_fc_layers:
+            # 如果配置了额外全连接层，进行特征投影
             self.extra_linear = nn.Sequential(
                 nn.Linear(self.encoder_out_size, self.encoder_cfg.hidden_size),
                 activation_func(self.encoder_cfg),
             )
             self.encoder_out_size = self.encoder_cfg.hidden_size
 
-        log.debug('ST-GAT-Former max_neighbors: %r, d_model: %r', self._max_neighbors, d_model)
+        log.debug('STGATFormerEncoder tokens: %r, d_model: %r', self.num_tokens, d_model)
 
     def get_out_size(self) -> int:
         return self.encoder_out_size
 
     def forward(self, x):
         obs = x['obs']
+        obs = self.cnn(obs)
 
-        grid_feat = self.grid_encoder(obs)
-        self_token = self.grid_pool(grid_feat).flatten(1)
+        tokens = obs.flatten(2).transpose(1, 2)
 
-        if 'xy' in x and 'target_xy' in x:
-            goal_vec = (x['target_xy'] - x['xy']).to(self_token.dtype)
-            if goal_vec.ndim == 1:
-                goal_vec = goal_vec.unsqueeze(0)
+        if self._has_global_map and 'global_map' in x:
+            gm = x['global_map']
+            if getattr(gm, 'ndim', None) == 3:
+                gm = gm.unsqueeze(1)
+            if not torch.is_floating_point(gm):
+                gm = gm.float()
+
+            gm = self.global_cnn(gm)
+            gm_tokens = gm.flatten(2).transpose(1, 2)
+            tokens = torch.cat([tokens, gm_tokens], dim=1)
+
+        if self.cls_token is not None:
+            cls = self.cls_token.expand(tokens.shape[0], -1, -1)
+            tokens = torch.cat([cls, tokens], dim=1)
+
+        tokens = tokens + self.pos_embed[:, :tokens.shape[1], :]
+        tokens = self.transformer(tokens)
+
+        if self.cls_token is not None:
+            x = tokens[:, 0]
         else:
-            goal_vec = self_token.new_zeros((self_token.shape[0], 2))
-        goal_emb = self.goal_mlp(goal_vec)
-
-        heur_map = obs[:, :1]
-        heur_emb = self.heur_encoder(heur_map).flatten(1)
-
-        self_node = (self_token + goal_emb + heur_emb).unsqueeze(1)
-
-        if 'agents_xy' in x and self._max_neighbors > 0:
-            neigh_xy = x['agents_xy'].to(self_node.dtype)
-            if neigh_xy.ndim == 2:
-                neigh_xy = neigh_xy.unsqueeze(0)
-            neigh_xy = neigh_xy[:, :self._max_neighbors]
-            neigh_nodes = self.neighbor_mlp(neigh_xy)
-        else:
-            neigh_nodes = self_node.new_zeros((self_node.shape[0], self._max_neighbors, self_node.shape[-1]))
-
-        nodes = torch.cat([self_node, neigh_nodes], dim=1)
-
-        if 'agents_xy_mask' in x and self._max_neighbors > 0:
-            neigh_mask = x['agents_xy_mask']
-            if neigh_mask.ndim == 1:
-                neigh_mask = neigh_mask.unsqueeze(0)
-            neigh_mask = neigh_mask[:, :self._max_neighbors]
-            pad = neigh_mask <= 0.0
-        else:
-            pad = torch.ones((nodes.shape[0], self._max_neighbors), device=nodes.device, dtype=torch.bool)
-
-        key_padding_mask = torch.cat(
-            [torch.zeros((nodes.shape[0], 1), device=nodes.device, dtype=torch.bool), pad.to(torch.bool)],
-            dim=1,
-        )
-
-        attn_mask = self._star_attn_mask
-        if attn_mask.device != nodes.device:
-            attn_mask = attn_mask.to(nodes.device)
-        attn_out, _ = self.gat_attn(
-            nodes,
-            nodes,
-            nodes,
-            key_padding_mask=key_padding_mask,
-            attn_mask=attn_mask,
-            need_weights=False,
-        )
-        nodes = self.gat_norm(nodes + attn_out)
-
-        nodes = self.temporal_transformer(nodes, src_key_padding_mask=key_padding_mask)
-
-        out = nodes[:, 0]
+            x = tokens.mean(dim=1)
 
         if self.encoder_cfg.extra_fc_layers:
-            out = self.extra_linear(out)
+            x = self.extra_linear(x) # （16, 64) -> (16, 512)
 
-        return out
+        return x       
 
 
 def main():
@@ -524,10 +511,39 @@ def main():
     exp_cfg = {'encoder': EncoderConfig().dict()}  # 创建默认编码器配置
     r = 5  # 观测半径
     obs = torch.rand(1, 3, r * 2 + 1, r * 2 + 1)  # 创建随机观测（batch=1, channels=3, 11x11）
-    q_obs = {'obs': obs}  # 构建观测字典
+    global_map = torch.zeros(1, 15, 15) # 帮我创建一个15x15的随机全局地图
+    q_obs = {'obs': obs, 'global_map': global_map}  # 构建观测字典
     # noinspection PyTypeChecker
-    re = ResnetEncoder(Namespace(**exp_cfg), dict(obs=obs[0]))  # 创建编码器（使用第一个样本的形状作为obs_space）
+    re = STGATFormerEncoder(Namespace(**exp_cfg), dict(obs=obs[0], global_map=global_map[0]))  # 创建编码器（使用第一个样本的形状作为obs_space）
     re(q_obs)  # 前向传播测试
+
+    batch_size = 8
+    r = 5
+    d = r * 2 + 1
+    side = 15
+
+    exp_cfg = {'encoder': EncoderConfig(extra_fc_layers=1, hidden_size=128).dict()}
+    obs = torch.rand(batch_size, 3, d, d)
+    global_map = torch.rand(batch_size, side, side)
+    q_obs = {'obs': obs, 'global_map': global_map}
+
+    st = STGATFormerEncoder(Namespace(**exp_cfg), dict(obs=obs[0], global_map=global_map[0]))
+    head = nn.Linear(st.get_out_size(), 1)
+    opt = torch.optim.Adam(list(st.parameters()) + list(head.parameters()), lr=1e-3)
+
+    for _ in range(5):
+        opt.zero_grad(set_to_none=True)
+        y = head(st(q_obs))
+        target = torch.zeros_like(y)
+        loss = torch.mean((y - target) ** 2)
+        loss.backward()
+
+        params = list(st.parameters()) + list(head.parameters())
+        if not all(p.grad is None or torch.isfinite(p.grad).all() for p in params):
+            raise RuntimeError('Non-finite gradients in STGATFormerEncoder test')
+
+        opt.step()
+        print('STGATFormerEncoder train step loss:', float(loss.detach().cpu()))
 
 
 if __name__ == '__main__':

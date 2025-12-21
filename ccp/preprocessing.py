@@ -25,6 +25,7 @@ class PreprocessorConfig(PlannerConfig):
     intrinsic_target_reward: float = 0.01  # 到达子目标时的内在奖励值
 
     graph_max_neighbors: int = 8
+    cache_map_side: int = 51
 
 
 def ccp_preprocessor(env, algo_config):
@@ -80,6 +81,7 @@ def wrap_preprocessors(env, config: PreprocessorConfig, auto_reset=False):
     '''
     env = CCPWrapper(env=env, config=config)  # 添加路径规划和内在奖励
     env = CutObservationWrapper(env, target_observation_radius=config.network_input_radius)  # 裁剪观测大小
+    env = CacheMapWrapper(env, cache_map_side=config.cache_map_side)
     env = GraphInputsWrapper(env, max_neighbors=config.graph_max_neighbors)
     env = ConcatPositionalFeatures(env)  # 拼接位置特征
     if auto_reset:
@@ -229,7 +231,7 @@ class CCPWrapper(ObservationWrapper):
             obs = observations[k]
 
             # 检查是否有有效路径
-            if path is None:
+            if path is None or len(path) < 2:
                 new_goals.append(obs['target_xy'])  # 使用目标位置作为子目标
                 path = []
             else:
@@ -239,6 +241,7 @@ class CCPWrapper(ObservationWrapper):
                 intrinsic_rewards.append(self._cfg.intrinsic_target_reward if subgoal_achieved else 0.0)
                 # 选择路径上的下一个点作为新的子目标
                 new_goals.append(path[1])
+                
 
             # 将观测中的障碍物值设置为-1.0（便于与路径区分）
             obs['obstacles'][obs['obstacles'] > 0] *= -1
@@ -451,9 +454,9 @@ class ConcatPositionalFeatures(ObservationWrapper):
         for agent_idx, obs in enumerate(observations):
             # 按顺序拼接所有位置特征：[None]增加一个维度用于拼接
             main_obs = np.concatenate([obs[key][None] for key in self.to_concat], axis=0)
-            # 删除已拼接的原始特征
-            for key in self.to_concat:
-                del obs[key]
+            # # 删除已拼接的原始特征
+            # for key in self.to_concat:
+            #     del obs[key]
 
             # 将剩余特征转换为float32
             for key in obs:
@@ -524,3 +527,129 @@ class AutoResetWrapper(gymnasium.Wrapper):
         if all(terminated) or all(truncated):
             observations, _ = self.env.reset()  # 获取新回合的初始观测
         return observations, rewards, terminated, truncated, infos
+
+
+class CacheMapWrapper(ObservationWrapper):
+    """缓存地图包装器，将缓存地图作为本地观测的一部分。
+
+    desc:
+        每个智能体都有一个独立的缓存地图，这个地图是一个正方形的地图，大小根据实际地图进行判断，如果地图长宽不一致，则选择长边作为地图的边长，实际地图范围外的单元用9999填充
+        缓存地图会随着智能体的移动而更新，更新的内容是将智能体当前观测到的障碍物位置记录到缓存地图实际的位置上。
+        缓存地图会作为智能体路径规划算法观测信息的一部分送入模型进行训练。
+    """
+
+    def __init__(self, env, cache_map_side: int):
+        super().__init__(env)
+        self._cache_maps = None
+        self._map_h = None
+        self._map_w = None
+        self._side = int(cache_map_side)
+        self._scale_x = None
+        self._scale_y = None
+
+        observation_space = Dict(self.observation_space)
+        observation_space['global_map'] = Box(-1e9, 1e9, shape=(self._side, self._side))
+        self.observation_space = observation_space
+
+
+    def reset_state(self, num_agents: int):
+        """
+        重置缓存地图
+        """
+        global_map = self.get_global_obstacles() # 获取全局障碍物信息
+        h = len(global_map) # 获取地图高度
+        w = max((len(row) for row in global_map), default=0) # 获取地图宽度
+        self._map_h = int(h)
+        self._map_w = int(w)
+
+        self._cache_maps = [] # 缓存地图，如果有16个智能体，那么这里就有16个缓存地图（16，side，side）
+        for _ in range(int(num_agents)):
+            # 初始化每个智能体的缓存地图
+            cache = np.zeros((h, w), dtype=np.float32)
+            if self._side > h:
+                cache[h:, :] = -1
+            if self._side > w:
+                cache[:, w:] = -1
+            self._cache_maps.append(cache)
+
+    def _update_cache_map(self, agent_idx: int, obs):
+        '''
+        更新angent_idx的缓存地图
+        args:
+            agent_idx: 智能体的索引
+            obs: 智能体的当前观测
+        '''
+        self._agents = self.get_positions()
+
+        if self._cache_maps is None or agent_idx >= len(self._cache_maps):
+            return
+
+        obstacles = obs.get('obstacles', None)
+        xy = obs.get('xy', None) # 获取智能体的局部的相对位置信息
+        if xy is None:
+            return
+        if not hasattr(obstacles, 'shape') or getattr(obstacles, 'ndim', None) != 2:
+            return
+
+        # 确定单个智能体的fov视野的左上角位置，用于映射到全局地图
+        base_x = self._agents[agent_idx][0] - 5
+        base_y = self._agents[agent_idx][1] - 5
+
+        coords = np.argwhere(obstacles < 0) # 获取障碍物位置
+        if coords.size == 0:
+            return
+       
+        cache = self._cache_maps[agent_idx]
+        for dx, dy in coords:
+            gx = base_x + int(dx)
+            gy = base_y + int(dy)
+            if 0 <= gx < self._map_h and 0 <= gy < self._map_w:
+                cache[gx, gy] = -1.0
+
+    def observation(self, observations):
+        if self._cache_maps is None:
+            self.reset_state(len(observations))
+
+        for agent_idx, obs in enumerate(observations):
+            self._update_cache_map(agent_idx, obs)
+            obs['global_map'] = self.get_fov_cache_map(agent_idx)
+        return observations
+
+    def get_fov_cache_map(self, agent_idx):
+
+        side = int(self._side)
+        half = int(side // 2)
+        ax, ay = int(self._agents[agent_idx][0]), int(self._agents[agent_idx][1])
+
+        base_x = ax - half
+        base_y = ay - half
+        end_x = base_x + side
+        end_y = base_y + side
+
+        cache = self._cache_maps[agent_idx]
+        h, w = int(cache.shape[0]), int(cache.shape[1])
+
+        out = np.full((side, side), -1.0, dtype=np.float32)
+
+        src_x0 = max(base_x, 0)
+        src_y0 = max(base_y, 0)
+        src_x1 = min(end_x, h)
+        src_y1 = min(end_y, w)
+
+        if src_x1 <= src_x0 or src_y1 <= src_y0:
+            print('wrong! src_x1 <= src_x0 or src_y1 <= src_y0')
+            return out
+
+        dst_x0 = src_x0 - base_x
+        dst_y0 = src_y0 - base_y
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+
+        out[dst_x0:dst_x1, dst_y0:dst_y1] = cache[src_x0:src_x1, src_y0:src_y1]
+        return out
+
+    def reset(self, **kwargs):
+        observations, infos = self.env.reset(**kwargs)
+        self.reset_state(len(observations))
+        return self.observation(observations), infos
+

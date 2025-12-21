@@ -39,7 +39,7 @@ class EncoderConfig(BaseModel):
     - Follower: num_filters=64, num_res_blocks=8, extra_fc_layers=1, hidden_size=512
     - FollowerLite: num_filters=8, num_res_blocks=1, extra_fc_layers=0
     '''
-    encoder_arch: Literal['resnet', 'cnn_transformer'] = 'resnet'
+    encoder_arch: Literal['resnet', 'cnn_transformer', 'st_gat_former'] = 'cnn_transformer'
     extra_fc_layers: int = 0  # 额外全连接层数量，默认0（不使用）
     num_filters: int = 64  # 卷积层滤波器数量，决定特征图通道数
     num_res_blocks: int = 1  # ResNet残差块数量，决定网络深度
